@@ -3,7 +3,9 @@ use super::{
     input, render,
 };
 use crate::decode::Packet;
-use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{backend::TestBackend, Terminal};
 
 fn app() -> App {
@@ -12,7 +14,7 @@ fn app() -> App {
         app.session
             .insert(Packet::new(id, 0, 64, 999, vec![0; 64].into_boxed_slice()));
     }
-    app.session.follow = false;
+    app.session.unfollow();
     app.session.select_index(0);
     app.tick();
     app
@@ -34,6 +36,95 @@ fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) {
             modifiers: KeyModifiers::NONE,
         }),
     );
+}
+
+#[test]
+fn auto_scroll_defaults_on_and_can_pause_and_resume_as_packets_arrive() {
+    for (width, height) in [(140, 42), (60, 22)] {
+        let mut app = App::new(None, 1024 * 1024, 100, "vivid");
+        let append = |app: &mut App, id| {
+            app.session
+                .insert(Packet::new(id, 0, 64, 999, vec![0; 64].into_boxed_slice()));
+            app.tick();
+        };
+        for id in 1..=30 {
+            append(&mut app, id);
+        }
+        let _ = draw(&mut app, width, height);
+        assert!(app.session.follow());
+        assert_eq!(app.session.selected(), Some(30));
+        assert_eq!(app.packet_offset, app.max_offset(Pane::Packets));
+
+        let toggle = app
+            .regions
+            .buttons
+            .iter()
+            .find(|(_, action)| matches!(action, Action::Follow))
+            .unwrap()
+            .0;
+        mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            toggle.y,
+        );
+        let paused_offset = app.packet_offset;
+        append(&mut app, 31);
+        let _ = draw(&mut app, width, height);
+        assert!(!app.session.follow());
+        assert_eq!(app.session.len(), 31);
+        assert_eq!(app.session.selected(), Some(30));
+        assert_eq!(app.packet_offset, paused_offset);
+
+        input::handle(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        );
+        let _ = draw(&mut app, width, height);
+        assert!(app.session.follow());
+        assert_eq!(app.session.selected(), Some(31));
+        assert_eq!(app.packet_offset, app.max_offset(Pane::Packets));
+        append(&mut app, 32);
+        let _ = draw(&mut app, width, height);
+        assert_eq!(app.session.selected(), Some(32));
+        assert_eq!(app.packet_offset, app.max_offset(Pane::Packets));
+
+        let rows = app.regions.packets;
+        mouse(&mut app, MouseEventKind::ScrollUp, rows.x, rows.y);
+        assert!(!app.session.follow());
+        let browsing_offset = app.packet_offset;
+        append(&mut app, 33);
+        let _ = draw(&mut app, width, height);
+        assert_eq!(app.packet_offset, browsing_offset);
+        assert_eq!(app.session.selected(), Some(32));
+    }
+}
+
+#[test]
+fn auto_scroll_state_and_toolbar_controls_remain_visible_on_narrow_terminals() {
+    let mut app = App::new(None, 1024 * 1024, 100, "vivid");
+    for expected in ["Auto-scroll ON", "Auto-scroll OFF"] {
+        for width in 60..=140 {
+            let terminal = draw(&mut app, width, 22);
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains(expected),
+                "missing {expected} at width {width}"
+            );
+            assert!(app
+                .regions
+                .buttons
+                .iter()
+                .any(|(_, action)| matches!(action, Action::Quit)));
+        }
+        app.apply(Action::Follow);
+    }
 }
 
 #[test]
@@ -74,7 +165,7 @@ fn mouse_selects_rows_scrolls_and_drags_dividers() {
         rows.x + 3,
         rows.y + 2,
     );
-    assert_eq!(app.session.selected, Some(3));
+    assert_eq!(app.session.selected(), Some(3));
     mouse(&mut app, MouseEventKind::ScrollDown, rows.x + 3, rows.y);
     assert_eq!(app.packet_offset, 3);
     let divider = app.regions.horizontal;
@@ -182,10 +273,11 @@ fn capture_permission_help_shows_the_capability_fix() {
         snaplen: 65535,
         promiscuous: false,
     });
-    app.status.error = Some(
+    app.ingest.status.error = Some(
         "libpcap error: Attempt to create packet socket failed - CAP_NET_RAW may be required"
             .into(),
     );
+    app.ingest.status.permission_denied = true;
     app.tick();
     app.apply(Action::Help);
     let terminal = draw(&mut app, 140, 42);
@@ -212,12 +304,12 @@ fn advancing_offline_windows_does_not_skip_packets() {
     loop {
         assert!(Instant::now() < deadline, "offline loading stalled");
         app.tick();
-        if app.window_full {
+        if app.ingest.window_full {
             assert!(app.session.len() <= 3);
-            ids.extend(app.session.visible.iter().copied());
+            ids.extend(app.session.visible().iter().copied());
             app.apply(Action::NextWindow);
-        } else if app.status.done {
-            ids.extend(app.session.visible.iter().copied());
+        } else if app.ingest.status.done {
+            ids.extend(app.session.visible().iter().copied());
             break;
         }
         std::thread::sleep(Duration::from_millis(1));

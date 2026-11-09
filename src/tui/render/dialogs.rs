@@ -48,7 +48,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     match &dialog {
         Dialog::Help => {
-            let text = if app.needs_capture_permission() {
+            let text = if app.ingest.status.permission_denied {
                 let executable = std::env::current_exe()
                     .map(|path| format!("'{}'", path.display().to_string().replace('\'', "'\\''")))
                     .unwrap_or_else(|_| "<path-to-packetread>".into());
@@ -68,7 +68,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     "Drag pane dividers or scrollbars to resize / navigate.",
                     "Tab / 1 / 2 / 3: choose pane. Arrows / j k: move.",
                     "Enter / Left / Right: expand or collapse protocol layer.",
-                    "Space: toggle follow. s: stop. r: start a new session.",
+                    "Space: auto-scroll ON/OFF. s: stop. r: new session.",
                     "o: open file. i: interfaces. b: BPF for the next capture.",
                     "/: edit display filter. Enter or Apply: apply it.",
                     "Examples: proto=tcp port=443 · addr=192.0.2.1",

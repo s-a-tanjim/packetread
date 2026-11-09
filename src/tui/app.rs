@@ -1,16 +1,13 @@
 use super::theme::Theme;
 use crate::{
-    decode::{details, Layer, Packet},
+    decode::{details, Layer},
     filter::Filter,
+    ingest::Ingest,
     session::Session,
-    source::{SourceSpec, Status, Worker},
+    source::SourceSpec,
 };
 use ratatui::layout::Rect;
-use std::{
-    collections::{BTreeSet, VecDeque},
-    ops::Range,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, ops::Range, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
@@ -135,14 +132,10 @@ pub enum Dialog {
 pub struct App {
     pub session: Session,
     pub source: Option<SourceSpec>,
-    pub worker: Option<Worker>,
-    pub status: Status,
-    pub pending: VecDeque<Packet>,
-    pub window_full: bool,
+    pub ingest: Ingest,
     pub theme: Theme,
     pub pane: Pane,
     pub filter: TextInput,
-    active_filter: String,
     pub editing_filter: bool,
     pub filter_error: Option<String>,
     pub dialog: Option<Dialog>,
@@ -159,13 +152,6 @@ pub struct App {
     pub drag: Option<Drag>,
     pub table_percent: u16,
     pub details_percent: u16,
-    pub packet_rate: u64,
-    pub byte_rate: u64,
-    pub packet_history: VecDeque<u64>,
-    pub byte_history: VecDeque<u64>,
-    rate_time: Instant,
-    rate_packets: u64,
-    rate_bytes: u64,
 }
 
 impl App {
@@ -173,14 +159,10 @@ impl App {
         Self {
             session: Session::new(memory, max_packets),
             source,
-            worker: None,
-            status: Status::default(),
-            pending: VecDeque::new(),
-            window_full: false,
+            ingest: Ingest::default(),
             theme: Theme::named(theme),
             pane: Pane::Packets,
             filter: TextInput::default(),
-            active_filter: String::new(),
             editing_filter: false,
             filter_error: None,
             dialog: None,
@@ -197,13 +179,6 @@ impl App {
             drag: None,
             table_percent: 55,
             details_percent: 45,
-            packet_rate: 0,
-            byte_rate: 0,
-            packet_history: VecDeque::from(vec![0; 60]),
-            byte_history: VecDeque::from(vec![0; 60]),
-            rate_time: Instant::now(),
-            rate_packets: 0,
-            rate_bytes: 0,
         }
     }
     pub fn start(&mut self) {
@@ -211,24 +186,16 @@ impl App {
             self.apply(Action::Interfaces);
             return;
         };
-        // Dropping a worker cancels it, including a blocked offline producer.
-        self.worker.take();
-        self.session = Session::new(self.session.byte_limit, self.session.packet_limit);
-        let _ = self.session.set_filter(&self.active_filter);
-        self.pending.clear();
-        self.window_full = false;
+        // Dropping the old ingest cancels its worker, including a blocked
+        // offline producer, before the new one starts.
+        self.ingest = Ingest::default();
+        self.session.restart();
         self.cached_id = None;
         self.layers.clear();
         self.packet_offset = 0;
-        self.status = Status::default();
-        self.rate_packets = 0;
-        self.rate_bytes = 0;
-        self.rate_time = Instant::now();
-        self.packet_history.make_contiguous().fill(0);
-        self.byte_history.make_contiguous().fill(0);
-        match Worker::start(spec) {
-            Ok(worker) => {
-                self.worker = Some(worker);
+        match Ingest::start(spec) {
+            Ok(ingest) => {
+                self.ingest = ingest;
                 self.notice = "Opening source…".into();
             }
             Err(error) => self.notice = format!("Cannot start capture: {error}"),
@@ -236,96 +203,53 @@ impl App {
     }
 
     pub fn tick(&mut self) -> bool {
-        let previous_status = self.status.clone();
-        let previous_selection = self.session.selected;
+        let previous_status = self.ingest.status.clone();
+        let previous_selection = self.session.selected();
         let previous_len = self.session.len();
-        let previous_evicted = self.session.evicted;
-        let was_filtering = self.session.filtering;
-        let mut rate_changed = false;
-        let live = self.source.as_ref().is_some_and(SourceSpec::is_live);
-        let started = Instant::now();
-        if let Some(worker) = &self.worker {
-            self.status = worker.status();
-            while !self.window_full && started.elapsed() < Duration::from_millis(3) {
-                if self.pending.is_empty() {
-                    match worker.packets.try_recv() {
-                        Ok(batch) => self.pending = batch.into(),
-                        Err(_) => break,
-                    }
-                }
-                let Some(packet) = self.pending.front() else {
-                    break;
-                };
-                if !live && !self.session.has_room(packet) {
-                    self.window_full = true;
-                    self.notice =
-                        "File window full · click Next to continue; earlier packets leave memory"
-                            .into();
-                    break;
-                }
-                if let Some(packet) = self.pending.pop_front() {
-                    self.session.insert(packet);
-                }
-            }
+        let previous_evicted = self.session.evicted();
+        let was_filtering = self.session.filtering();
+        let was_full = self.ingest.window_full;
+        let rate_changed = self
+            .ingest
+            .tick(&mut self.session, Duration::from_millis(3));
+        if self.ingest.window_full && !was_full {
+            self.notice =
+                "File window full · click Next to continue; earlier packets leave memory".into();
         }
         self.session.filter_step(Duration::from_millis(2));
-        if self.cached_id != self.session.selected {
+        if self.cached_id != self.session.selected() {
             self.layers = self
                 .session
                 .selected_packet()
                 .map(|p| details(&p.bytes, p.link))
                 .unwrap_or_default();
-            self.cached_id = self.session.selected;
+            self.cached_id = self.session.selected();
             self.collapsed.clear();
             self.detail_selected = 0;
             self.detail_offset = 0;
             self.byte_offset = 0;
         }
-        if let Some(notice) = self.session.notice.take() {
+        if let Some(notice) = self.session.take_notice() {
             self.notice = notice;
         }
-        if self.needs_capture_permission() {
+        let status = &self.ingest.status;
+        if status.permission_denied {
             self.notice =
                 "Live capture needs CAP_NET_RAW · click Help for setup instructions".into();
-            if previous_status.error != self.status.error && self.dialog.is_none() {
+            if previous_status.error != status.error && self.dialog.is_none() {
                 self.dialog = Some(Dialog::Help);
             }
-        } else if let Some(error) = &self.status.error {
+        } else if let Some(error) = &status.error {
             self.notice = format!("Source error: {error}");
-        } else if self.notice == "Opening source…" && (self.status.packets > 0 || self.status.done)
-        {
+        } else if self.notice == "Opening source…" && (status.packets > 0 || status.done) {
             self.notice = "Select packets and protocol fields to inspect their bytes".into();
-        }
-        let elapsed = self.rate_time.elapsed().as_secs_f64();
-        if elapsed >= 1.0 {
-            rate_changed = true;
-            self.packet_rate =
-                ((self.status.packets.saturating_sub(self.rate_packets)) as f64 / elapsed) as u64;
-            self.byte_rate =
-                ((self.status.bytes.saturating_sub(self.rate_bytes)) as f64 / elapsed) as u64;
-            self.packet_history.pop_front();
-            self.packet_history.push_back(self.packet_rate);
-            self.byte_history.pop_front();
-            self.byte_history.push_back(self.byte_rate);
-            self.rate_packets = self.status.packets;
-            self.rate_bytes = self.status.bytes;
-            self.rate_time = Instant::now();
         }
         rate_changed
             || was_filtering
-            || self.status != previous_status
-            || self.session.selected != previous_selection
+            || *status != previous_status
+            || self.session.selected() != previous_selection
             || self.session.len() != previous_len
-            || self.session.evicted != previous_evicted
-    }
-
-    pub fn needs_capture_permission(&self) -> bool {
-        self.source.as_ref().is_some_and(SourceSpec::is_live)
-            && self
-                .status
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("CAP_NET_RAW"))
+            || self.session.evicted() != previous_evicted
     }
 
     pub fn detail_rows(&self) -> Vec<(usize, Option<usize>)> {
@@ -355,7 +279,7 @@ impl App {
         match pane {
             Pane::Packets => self
                 .session
-                .visible
+                .visible()
                 .len()
                 .saturating_sub(self.regions.packets.height as usize),
             Pane::Details => self
@@ -381,7 +305,7 @@ impl App {
         match pane {
             Pane::Packets => {
                 self.packet_offset = offset;
-                self.session.follow = false;
+                self.session.unfollow();
             }
             Pane::Details => self.detail_offset = offset,
             Pane::Bytes => self.byte_offset = offset,
@@ -416,16 +340,12 @@ impl App {
             }
             Action::Start => self.start(),
             Action::Stop => {
-                if let Some(worker) = &self.worker {
-                    worker.stop();
-                }
+                self.ingest.stop();
                 self.notice = "Capture stopped; retained packets remain available".into();
             }
             Action::Follow => self.session.toggle_follow(),
             Action::NextWindow => {
-                if self.window_full {
-                    self.session.next_window();
-                    self.window_full = false;
+                if self.ingest.next_window(&mut self.session) {
                     self.packet_offset = 0;
                 }
             }
@@ -444,7 +364,6 @@ impl App {
             }
             Action::ApplyFilter => match self.session.set_filter(&self.filter.value) {
                 Ok(()) => {
-                    self.active_filter = self.filter.value.clone();
                     self.editing_filter = false;
                     self.filter_error = None;
                     self.packet_offset = 0;
@@ -549,9 +468,7 @@ impl App {
             }
             Some(Dialog::Interfaces { entries, selected }) => {
                 if let Some(interface) = entries.get(selected) {
-                    self.worker.take();
-                    self.pending.clear();
-                    self.status.done = true;
+                    self.ingest.detach();
                     self.source = Some(SourceSpec::Live {
                         interface: interface.clone(),
                         filter: String::new(),

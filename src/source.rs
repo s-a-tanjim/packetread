@@ -47,9 +47,12 @@ pub struct Status {
     pub kernel_drops: Option<u32>,
     pub done: bool,
     pub error: Option<String>,
+    /// The live capture could not be opened for lack of `CAP_NET_RAW`.
+    pub permission_denied: bool,
 }
 
 pub struct Worker {
+    /// Capture completion and errors are published before this channel disconnects.
     pub packets: Receiver<Vec<Packet>>,
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
@@ -65,14 +68,7 @@ impl Worker {
         let cancelled = Arc::clone(&stop);
         let join = thread::Builder::new()
             .name("capture".into())
-            .spawn(move || {
-                let mut current = Status::default();
-                if let Err(error) = capture(spec, tx, &cancelled, &shared, &mut current) {
-                    current.error = Some(error.to_string());
-                }
-                current.done = true;
-                *shared.lock().unwrap_or_else(|e| e.into_inner()) = current;
-            })?;
+            .spawn(move || run_worker(spec, tx, &cancelled, &shared))?;
         Ok(Self {
             packets,
             status,
@@ -89,6 +85,22 @@ impl Worker {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+fn run_worker(
+    spec: SourceSpec,
+    tx: SyncSender<Vec<Packet>>,
+    stop: &AtomicBool,
+    shared: &Mutex<Status>,
+) {
+    let mut current = Status::default();
+    if let Err(error) = capture(spec, &tx, stop, shared, &mut current) {
+        current.error = Some(error.to_string());
+    }
+    current.done = true;
+    *shared.lock().unwrap_or_else(|e| e.into_inner()) = current;
+    // Receivers use disconnection as completion, so publish before waking them.
+    drop(tx);
 }
 
 impl Drop for Worker {
@@ -147,7 +159,7 @@ impl Handle {
 
 fn capture(
     spec: SourceSpec,
-    tx: SyncSender<Vec<Packet>>,
+    tx: &SyncSender<Vec<Packet>>,
     stop: &AtomicBool,
     shared: &Mutex<Status>,
     status: &mut Status,
@@ -166,7 +178,12 @@ fn capture(
                 .snaplen(snaplen)
                 .buffer_size(4 * 1024 * 1024)
                 .timeout(20)
-                .open()?
+                .open()
+                .inspect_err(|error| {
+                    // The pcap crate flattens libpcap's PCAP_ERROR_PERM_DENIED
+                    // into text, so this is the one place that reads it.
+                    status.permission_denied = error.to_string().contains("CAP_NET_RAW");
+                })?
                 .setnonblock()?;
             if !filter.trim().is_empty() {
                 capture.filter(&filter, true)?;
@@ -186,7 +203,7 @@ fn capture(
                 status.packets += 1;
                 status.bytes += u64::from(packet.wire_len);
                 if batch_bytes + packet.memory_size() > BATCH_BYTES && !batch.is_empty() {
-                    if !send_batch(&tx, std::mem::take(&mut batch), live, stop, status) {
+                    if !send_batch(tx, std::mem::take(&mut batch), live, stop, status) {
                         break;
                     }
                     batch_bytes = 0;
@@ -205,7 +222,7 @@ fn capture(
                 status.error = Some(error.to_string());
                 *shared.lock().unwrap_or_else(|e| e.into_inner()) = status.clone();
                 if !batch.is_empty() {
-                    send_batch(&tx, std::mem::take(&mut batch), live, stop, status);
+                    send_batch(tx, std::mem::take(&mut batch), live, stop, status);
                 }
                 return Err(error);
             }
@@ -215,7 +232,7 @@ fn capture(
             || last_flush.elapsed() >= Duration::from_millis(16)
             || eof
         {
-            if !batch.is_empty() && !send_batch(&tx, std::mem::take(&mut batch), live, stop, status)
+            if !batch.is_empty() && !send_batch(tx, std::mem::take(&mut batch), live, stop, status)
             {
                 break;
             }
@@ -237,7 +254,7 @@ fn capture(
         }
     }
     if !batch.is_empty() {
-        send_batch(&tx, batch, live, stop, status);
+        send_batch(tx, batch, live, stop, status);
     }
     Ok(())
 }
@@ -271,6 +288,37 @@ fn send_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_worker_publishes_error_before_closing_packet_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let spec = SourceSpec::File(temp.path().join("missing.pcap"));
+        let (tx, rx) = mpsc::sync_channel(64);
+        let shared = Arc::new(Mutex::new(Status::default()));
+        // Delay publication to expose the ordering regardless of CPU scheduling.
+        let unpublished = shared.lock().unwrap();
+        let worker_status = Arc::clone(&shared);
+        let worker = thread::spawn(move || {
+            run_worker(spec, tx, &AtomicBool::new(false), &worker_status);
+        });
+
+        let before_publication = rx.recv_timeout(Duration::from_millis(100));
+        drop(unpublished);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        worker.join().unwrap();
+        assert!(
+            matches!(before_publication, Err(mpsc::RecvTimeoutError::Timeout)),
+            "packet channel closed before the final error could be published: {before_publication:?}"
+        );
+        let status = shared.lock().unwrap();
+        assert!(status.done);
+        assert!(status.error.as_deref().unwrap().contains("missing.pcap"));
+        assert_eq!(status.packets, 0);
+    }
+
     #[test]
     fn live_queue_overload_is_counted() {
         let (tx, _rx) = mpsc::sync_channel(1);

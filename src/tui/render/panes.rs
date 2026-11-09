@@ -15,11 +15,11 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
     let title = format!(
         " PACKETS · {} matches {} ",
-        app.session.visible.len(),
-        if app.session.follow {
-            "· FOLLOW"
+        app.session.visible().len(),
+        if app.session.follow() {
+            "· AUTO-SCROLL ON"
         } else {
-            "· BROWSE"
+            "· AUTO-SCROLL OFF"
         }
     );
     let inner = panel(
@@ -40,7 +40,7 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
         inner.height.saturating_sub(1),
     );
     app.regions.packets = rows;
-    if app.session.follow {
+    if app.session.follow() {
         app.reveal_packet();
     }
     app.packet_offset = app.packet_offset.min(app.max_offset(Pane::Packets));
@@ -64,7 +64,7 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = Vec::new();
     for id in app
         .session
-        .visible
+        .visible()
         .iter()
         .skip(app.packet_offset)
         .take(rows.height as usize)
@@ -104,7 +104,7 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(theme.text),
                 ));
             }
-            if app.session.selected == Some(*id) {
+            if app.session.selected() == Some(*id) {
                 for span in &mut spans {
                     span.style = bold(theme.bg).bg(theme.cyan);
                 }
@@ -112,8 +112,8 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::from(spans));
         }
     }
-    if app.session.visible.is_empty() {
-        let text = if app.session.filtering {
+    if app.session.visible().is_empty() {
+        let text = if app.session.filtering() {
             "Rebuilding filter…"
         } else if !app.session.is_empty() {
             "No matching packets. Click the filter to change it."
@@ -123,7 +123,7 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::styled(text, Style::default().fg(theme.muted)));
     }
     frame.render_widget(Paragraph::new(lines), rows);
-    let count = app.session.visible.len();
+    let count = app.session.visible().len();
     let offset = app.packet_offset;
     scrollbar(
         frame,

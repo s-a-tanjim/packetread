@@ -1,4 +1,31 @@
-use super::be16;
+use super::{be16, Decoder, Protocol};
+
+impl Decoder<'_> {
+    /// Port 53 is only a guess: the payload is labelled DNS if it parses.
+    pub(super) fn dns(&mut self, start: usize, end: usize) {
+        let bytes = self.bytes;
+        match summary(&bytes[start..end]) {
+            Ok(info) => {
+                self.summary.protocol = Protocol::Dns;
+                self.summary.info = info;
+                self.layer("DNS (UDP)", start, end);
+                self.field(start, start + 2, || {
+                    format!("Transaction ID: 0x{:04x}", be16(bytes, start))
+                });
+                self.field(start + 2, start + 4, || {
+                    format!("Flags: 0x{:04x}", be16(bytes, start + 2))
+                });
+                self.field(start + 4, start + 6, || {
+                    format!("Questions: {}", be16(bytes, start + 4))
+                });
+                self.field(start + 6, start + 8, || {
+                    format!("Answers: {}", be16(bytes, start + 6))
+                });
+            }
+            Err(error) => self.warn(format!("Port 53: {error}")),
+        }
+    }
+}
 
 pub fn summary(data: &[u8]) -> Result<String, &'static str> {
     if data.len() < 12 {

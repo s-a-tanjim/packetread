@@ -5,26 +5,26 @@ use std::{
 };
 
 pub struct Session {
+    // IDs increase monotonically, so the first key is always the oldest packet.
     packets: BTreeMap<u64, Packet>,
-    order: VecDeque<u64>,
-    pub visible: VecDeque<u64>,
-    pub selected: Option<u64>,
-    pub follow: bool,
-    pub bytes: usize,
-    pub evicted: u64,
-    pub notice: Option<String>,
-    pub byte_limit: usize,
-    pub packet_limit: usize,
+    // Sorted subset of `packets` matching the filter; `selected` is a member.
+    visible: VecDeque<u64>,
+    selected: Option<u64>,
+    follow: bool,
+    bytes: usize,
+    evicted: u64,
+    notice: Option<String>,
+    byte_limit: usize,
+    packet_limit: usize,
     filter: Filter,
     scan_after: Option<u64>,
-    pub filtering: bool,
+    filtering: bool,
 }
 
 impl Session {
     pub fn new(byte_limit: usize, packet_limit: usize) -> Self {
         Self {
             packets: BTreeMap::new(),
-            order: VecDeque::new(),
             visible: VecDeque::new(),
             selected: None,
             follow: true,
@@ -38,11 +38,46 @@ impl Session {
             filtering: false,
         }
     }
+    /// Forgets every packet and counter; keeps the limits and the filter.
+    pub fn restart(&mut self) {
+        let filter = std::mem::take(&mut self.filter);
+        *self = Self {
+            filter,
+            ..Self::new(self.byte_limit, self.packet_limit)
+        };
+    }
     pub fn len(&self) -> usize {
-        self.order.len()
+        self.packets.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.packets.is_empty()
+    }
+    pub fn visible(&self) -> &VecDeque<u64> {
+        &self.visible
+    }
+    pub fn selected(&self) -> Option<u64> {
+        self.selected
+    }
+    pub fn follow(&self) -> bool {
+        self.follow
+    }
+    pub fn unfollow(&mut self) {
+        self.follow = false;
+    }
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+    pub fn byte_limit(&self) -> usize {
+        self.byte_limit
+    }
+    pub fn evicted(&self) -> u64 {
+        self.evicted
+    }
+    pub fn filtering(&self) -> bool {
+        self.filtering
+    }
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.notice.take()
     }
     pub fn packet(&self, id: u64) -> Option<&Packet> {
         self.packets.get(&id)
@@ -59,7 +94,7 @@ impl Session {
             self.notice = Some("Packet exceeds storage budget".into());
             return;
         }
-        while !self.has_room(&packet) && !self.order.is_empty() {
+        while !self.has_room(&packet) && !self.packets.is_empty() {
             self.evict_one();
         }
         let id = packet.id;
@@ -71,14 +106,11 @@ impl Session {
                 self.selected = Some(id);
             }
         }
-        self.order.push_back(id);
         self.packets.insert(id, packet);
     }
     fn evict_one(&mut self) {
-        if let Some(id) = self.order.pop_front() {
-            if let Some(packet) = self.packets.remove(&id) {
-                self.bytes -= packet.memory_size();
-            }
+        if let Some((id, packet)) = self.packets.pop_first() {
+            self.bytes -= packet.memory_size();
             if self.visible.front() == Some(&id) {
                 self.visible.pop_front();
             }
@@ -91,7 +123,6 @@ impl Session {
     }
     pub fn next_window(&mut self) {
         self.packets.clear();
-        self.order.clear();
         self.visible.clear();
         self.bytes = 0;
         self.selected = None;

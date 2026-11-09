@@ -54,13 +54,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .source
         .as_ref()
         .map_or_else(|| "no source".into(), |s| safe_text(&s.label()));
-    let state = if app.status.error.is_some() {
+    let state = if app.ingest.status.error.is_some() {
         "ERROR"
-    } else if app.window_full {
+    } else if app.ingest.window_full {
         "WINDOW FULL"
-    } else if app.worker.is_none() {
+    } else if !app.ingest.has_worker() {
         "READY"
-    } else if app.status.done {
+    } else if app.ingest.status.done {
         "FINISHED"
     } else if app.source.as_ref().is_some_and(|s| s.is_live()) {
         "LIVE"
@@ -135,7 +135,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .session
         .selected_packet()
         .and_then(|p| p.summary.warning.as_deref());
-    let line = if app.status.error.is_some() || app.window_full {
+    let line = if app.ingest.status.error.is_some() || app.ingest.window_full {
         app.notice.as_str()
     } else {
         app.filter_error
@@ -143,8 +143,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .or(selected_warning)
             .unwrap_or(&app.notice)
     };
-    let foot = vec![Line::styled(safe_text(line), Style::default().fg(if selected_warning.is_some() || app.status.error.is_some() { theme.yellow } else { theme.muted })),
-        Line::styled(" / filter  ·  Tab pane  ·  ↑↓/jk navigate  ·  Space follow  ·  ? help  ·  mouse enabled", Style::default().fg(theme.muted))];
+    let foot = vec![
+        Line::styled(
+            safe_text(line),
+            Style::default().fg(
+                if selected_warning.is_some() || app.ingest.status.error.is_some() {
+                    theme.yellow
+                } else {
+                    theme.muted
+                },
+            ),
+        ),
+        Line::styled(
+            " / filter · Tab pane · ↑↓/jk move · Space auto-scroll · ? help",
+            Style::default().fg(theme.muted),
+        ),
+    ];
     frame.render_widget(Paragraph::new(foot), chunks[6]);
     if app.dialog.is_some() {
         dialogs::draw(frame, app);
@@ -152,23 +166,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
-    let active = app.worker.is_some() && !app.status.done;
+    let active = app.ingest.has_worker() && !app.ingest.status.done;
     let live = app.source.as_ref().is_some_and(|s| s.is_live());
     let entries = [
         ("Open", Action::Open, true),
         ("Interfaces", Action::Interfaces, true),
         ("Start", Action::Start, !active),
         ("Stop", Action::Stop, active),
+        ("Next", Action::NextWindow, app.ingest.window_full),
         (
-            if app.session.follow {
-                "Follow ●"
+            if app.session.follow() {
+                "Auto-scroll ON"
             } else {
-                "Follow ○"
+                "Auto-scroll OFF"
             },
             Action::Follow,
             true,
         ),
-        ("Next", Action::NextWindow, app.window_full),
         ("BPF", Action::Bpf, live),
         ("Theme", Action::Theme, true),
         ("Help", Action::Help, true),
@@ -206,8 +220,11 @@ fn metrics(frame: &mut Frame, app: &App, area: Rect) {
     ])
     .split(area);
     let summary = vec![
-        Line::styled(format!("{} packets", app.status.packets), bold(theme.cyan)),
-        Line::from(format!("{} visible", app.session.visible.len())),
+        Line::styled(
+            format!("{} packets", app.ingest.status.packets),
+            bold(theme.cyan),
+        ),
+        Line::from(format!("{} visible", app.session.visible().len())),
         Line::styled(
             format!("{} retained", app.session.len()),
             Style::default().fg(theme.muted),
@@ -219,12 +236,12 @@ fn metrics(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(theme.text)),
         chunks[0],
     );
-    let pps: Vec<_> = app.packet_history.iter().copied().collect();
-    let bps: Vec<_> = app.byte_history.iter().copied().collect();
+    let pps: Vec<_> = app.ingest.packet_history.iter().copied().collect();
+    let bps: Vec<_> = app.ingest.byte_history.iter().copied().collect();
     frame.render_widget(
         Sparkline::default()
             .block(block(
-                format!(" {} pkt/s ", app.packet_rate),
+                format!(" {} pkt/s ", app.ingest.packet_rate),
                 theme.green,
                 theme,
             ))
@@ -235,7 +252,7 @@ fn metrics(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Sparkline::default()
             .block(block(
-                format!(" {}/s ", size(app.byte_rate)),
+                format!(" {}/s ", size(app.ingest.byte_rate)),
                 theme.purple,
                 theme,
             ))
@@ -244,26 +261,28 @@ fn metrics(frame: &mut Frame, app: &App, area: Rect) {
         chunks[2],
     );
     let drops = app
+        .ingest
         .status
         .kernel_drops
         .map_or_else(|| "n/a".into(), |n| n.to_string());
-    let loss_color = if app.status.app_drops > 0 || app.status.kernel_drops.unwrap_or(0) > 0 {
-        theme.red
-    } else {
-        theme.yellow
-    };
+    let loss_color =
+        if app.ingest.status.app_drops > 0 || app.ingest.status.kernel_drops.unwrap_or(0) > 0 {
+            theme.red
+        } else {
+            theme.yellow
+        };
     let status = vec![
         Line::styled(
-            format!("app {} · OS {drops}", app.status.app_drops),
+            format!("app {} · OS {drops}", app.ingest.status.app_drops),
             Style::default().fg(loss_color),
         ),
         Line::from(format!(
             "{} / {}",
-            size(app.session.bytes as u64),
-            size(app.session.byte_limit as u64)
+            size(app.session.bytes() as u64),
+            size(app.session.byte_limit() as u64)
         )),
         Line::styled(
-            format!("{} evicted", app.session.evicted),
+            format!("{} evicted", app.session.evicted()),
             Style::default().fg(theme.muted),
         ),
     ];
@@ -284,7 +303,7 @@ fn filter(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         theme.cyan
     };
-    let title = if app.session.filtering {
+    let title = if app.session.filtering() {
         " DISPLAY FILTER · rebuilding… "
     } else {
         " DISPLAY FILTER · proto=tcp port=443 "

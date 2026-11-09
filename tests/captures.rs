@@ -107,8 +107,14 @@ fn worker_delivers_the_complete_offline_capture() {
         }
     }
     assert_eq!(ids, (1..=11).collect::<Vec<_>>());
-    assert!(worker.status().error.is_none());
-    assert_eq!(worker.status().app_drops, 0);
+    let status = worker.status();
+    assert!(
+        status.done,
+        "packet channel closed before completion was published"
+    );
+    assert!(status.error.is_none());
+    assert_eq!(status.packets, 11);
+    assert_eq!(status.app_drops, 0);
 }
 
 #[test]
