@@ -129,7 +129,7 @@ Supported fields: `proto`, `addr`, `src`, `dst`, `port`. `addr` and `port` match
 - Both `open` and `summary` use a bounded Rust file reader: a fixed approximately 1 MiB input buffer, at most 1,024 interfaces per PCAPNG section, and at most 1 MiB per block. Oversized metadata or packets are rejected; these safety limits cannot be raised with `--memory`. Cancellation is checked between metadata blocks as well as packets. Libpcap is used for live capture and interface listing, not for reading saved files; the binary still links it, so the libpcap runtime must be installed even for offline-only use.
 - Live sessions evict the oldest retained packets. Queue overload discards incoming batches and increments **app drops**. **OS drops** are libpcap-reported statistics, or `n/a` when unavailable. Evictions are a separate counter.
 - Offline loading pauses when retention fills. **Next** discards the current window and continues reading. Full-file random access is not implemented. `summary` processes the whole file using bounded protocol counters.
-- Capture uses one worker, while the main thread handles bounded ingestion, incremental filtering, and rendering at up to 30 FPS. Performance targets in [the plan](docs/PLAN.md) still require measurement.
+- Capture uses one worker, while the main thread handles bounded ingestion, incremental filtering, and rendering at up to 30 FPS. Performance targets still require measurement.
 
 ## Development and tests
 
