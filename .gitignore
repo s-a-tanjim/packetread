@@ -1,0 +1,8 @@
+/target/
+/dist/
+__pycache__/
+*.pcap
+*.pcapng
+!tests/fixtures/*.pcap
+!tests/fixtures/*.pcapng
+

@@ -1,0 +1,24 @@
+[package]
+name = "packetread"
+version = "0.1.0"
+edition = "2021"
+description = "A colorful, mouse-friendly terminal packet inspector"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+etherparse = "0.21"
+pcap = "2.5"
+pcap-parser = "0.17"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[target."cfg(unix)".dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+

@@ -1,0 +1,132 @@
+name: CI and releases
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    name: Formatting and release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Validate version and release tag
+        id: version
+        run: |
+          version="$(python3 scripts/release-version.py)"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - run: cargo fmt --all --check
+      - run: python3 -m unittest discover -s tests -p 'test_release.py'
+      - run: bash -n scripts/package-release.sh
+
+  build:
+    name: Build and test (${{ matrix.target }})
+    needs: checks
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+          components: clippy
+      - name: Install native capture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpcap-dev pkg-config
+      - run: cargo clippy --locked --all-targets --target "$TARGET" -- -D warnings
+      - run: cargo test --locked --all-targets --target "$TARGET"
+      - run: cargo build --locked --release --target "$TARGET"
+      - name: Package and smoke-test the archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          bash scripts/package-release.sh "$TARGET"
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [checks, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.checks.outputs.version }}
+    steps:
+      - name: Download both architecture builds
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Verify both archives and assemble checksums
+        working-directory: dist
+        run: |
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            archive="packetread-${VERSION}-${target}.tar.gz"
+            test -f "$archive"
+            sha256sum --check "${archive}.sha256"
+          done
+          cat ./*.tar.gz.sha256 | LC_ALL=C sort -k2 > SHA256SUMS
+      - name: Publish verified assets
+        run: |
+          flags=()
+          if [[ "${VERSION%%+*}" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "Packetread $RELEASE_TAG" --generate-notes \
+            "${flags[@]}"
