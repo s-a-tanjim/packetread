@@ -8,7 +8,7 @@
 use crate::{
     decode::Packet,
     session::Session,
-    source::{SourceSpec, Status, Worker},
+    source::{Seek, SourceSpec, Status, Worker},
 };
 use std::{
     collections::VecDeque,
@@ -52,10 +52,10 @@ impl Default for Ingest {
 }
 
 impl Ingest {
-    pub fn start(spec: SourceSpec) -> std::io::Result<Self> {
+    pub fn start(spec: SourceSpec, seek: Seek) -> std::io::Result<Self> {
         Ok(Self {
             live: spec.is_live(),
-            worker: Some(Worker::start(spec)?),
+            worker: Some(Worker::start(spec, seek)?),
             ..Self::default()
         })
     }

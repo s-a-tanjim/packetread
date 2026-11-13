@@ -31,7 +31,7 @@ fn worker_error(path: &Path) -> String {
     let path = path.to_owned();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let worker = Worker::start(SourceSpec::File(path)).unwrap();
+        let worker = Worker::start(SourceSpec::File(path), Default::default()).unwrap();
         while worker.packets.recv().is_ok() {}
         let status = worker.status();
         drop(worker);

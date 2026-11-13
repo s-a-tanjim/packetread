@@ -1,7 +1,7 @@
 use super::{bold, button, input, panel};
 use crate::{
     decode::safe_text,
-    tui::app::{Action, App, Dialog},
+    tui::app::{Action, App, Dialog, View, HELP},
 };
 use ratatui::{
     layout::Rect,
@@ -19,9 +19,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.regions.buttons.clear();
     let full = frame.area();
     let theme = app.theme;
-    let width = full.width.saturating_sub(6).min(84);
+    let text = matches!(dialog, Dialog::Text { .. });
+    let width = full
+        .width
+        .saturating_sub(6)
+        .min(if text { 140 } else { 84 });
     let height = match dialog {
         Dialog::Help => 19,
+        Dialog::Text { .. } => full.height,
         Dialog::Interfaces { .. } => 16,
         _ => 8,
     }
@@ -34,10 +39,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     frame.render_widget(Clear, area);
     let title = match &dialog {
-        Dialog::Help => " HELP ",
-        Dialog::Open(_) => " OPEN CAPTURE FILE ",
-        Dialog::Bpf(_) => " CAPTURE FILTER (BPF) ",
-        Dialog::Interfaces { .. } => " SELECT INTERFACE ",
+        Dialog::Help => " HELP ".into(),
+        Dialog::Open(_) => " OPEN CAPTURE FILE ".into(),
+        Dialog::Bpf(_) => " CAPTURE FILTER (BPF) ".into(),
+        Dialog::Export(_, false) => " SAVE DISPLAYED PACKETS ".into(),
+        Dialog::Export(_, true) => " SAVE SELECTED PACKET ".into(),
+        Dialog::Find(_) => " FIND IN PACKET BYTES ".into(),
+        Dialog::Comment(_) => " PACKET COMMENT ".into(),
+        Dialog::Goto(_) => " GO TO PACKET ".into(),
+        Dialog::KeyLog(_) => " TLS KEY LOG ".into(),
+        Dialog::Interfaces { .. } => " SELECT INTERFACES ".into(),
+        Dialog::Text { title, .. } => safe_text(title),
     };
     let inner = panel(frame, area, title, theme.cyan, theme);
     let content = Rect::new(
@@ -49,37 +61,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match &dialog {
         Dialog::Help => {
             let text = if app.ingest.status.permission_denied {
-                let executable = std::env::current_exe()
+                let helper = crate::source::helper_path()
                     .map(|path| format!("'{}'", path.display().to_string().replace('\'', "'\\''")))
-                    .unwrap_or_else(|_| "<path-to-packetread>".into());
+                    .unwrap_or_else(|_| "<path-to-packetread-capture>".into());
                 format!(
                     "Live capture permission is missing.\n\n\
-                    Linux requires CAP_NET_RAW to open a packet socket.\n\
-                    Exit this application, then run in your terminal:\n\n\
-                    sudo setcap cap_net_raw=ep {executable}\n\n\
-                    Restart the application using that same binary.\n\
-                    Reapply the capability after rebuilding the binary.\n\n\
+                    Linux requires CAP_NET_RAW to open a packet socket. Only the\n\
+                    capture helper needs it; grant it in another terminal:\n\n\
+                    sudo setcap cap_net_raw=ep {helper}\n\n\
+                    Then click Start again; no restart is needed.\n\
+                    Reapply the capability after rebuilding or upgrading.\n\n\
                     Opening saved capture files needs no extra permission."
                 )
             } else {
-                [
-                    "Mouse: click controls, packets, fields and tabs.",
-                    "Wheel: scroll the pane under the pointer.",
-                    "Drag pane dividers or scrollbars to resize / navigate.",
-                    "Tab / 1 / 2 / 3: choose pane. Arrows / j k: move.",
-                    "Enter / Left / Right: expand or collapse protocol layer.",
-                    "Space: auto-scroll ON/OFF. s: stop. r: new session.",
-                    "o: open file. i: interfaces. b: BPF for the next capture.",
-                    "/: edit display filter. Enter or Apply: apply it.",
-                    "Examples: proto=tcp port=443 · addr=192.0.2.1",
-                    "Fields: proto, addr, src, dst, port. Space means AND.",
-                    "n / Next: next bounded file window. Earlier data is evicted.",
-                    "t: theme. q / Ctrl+C: quit. Esc: close dialog / editor.",
-                    "BPF controls capture; display filters search retained packets.",
-                    "OS drops may be unavailable. App drops and evictions differ.",
-                    "TCP reassembly and decryption are not yet supported.",
-                ]
-                .join("\n")
+                HELP.join("\n")
             };
             frame.render_widget(
                 Paragraph::new(safe_text_multiline(&text))
@@ -88,11 +83,77 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 content,
             );
         }
-        Dialog::Open(text) | Dialog::Bpf(text) => {
-            let hint = if matches!(dialog, Dialog::Open(_)) {
-                "Enter a PCAP/PCAPNG path. Opening begins a new session."
-            } else {
-                "Example: tcp port 443 · applies when you click Start again."
+        Dialog::Text {
+            lines,
+            offset,
+            view,
+            ..
+        } => {
+            let rows = content.height as usize;
+            let offset = (*offset).min(lines.len().saturating_sub(rows));
+            let visible: Vec<_> = lines
+                .iter()
+                .skip(offset)
+                .take(rows)
+                .map(|line| Line::raw(safe_text(line)))
+                .collect();
+            frame.render_widget(
+                Paragraph::new(visible).style(Style::default().fg(theme.text)),
+                content,
+            );
+            let options: &[(&str, Action)] = match view {
+                View::Stats => &[
+                    ("Unit (u)", Action::ViewUnit),
+                    ("Interval - ", Action::ViewInterval(false)),
+                    ("Interval + ", Action::ViewInterval(true)),
+                ],
+                View::Follow => &[
+                    ("Hex (h)", Action::ViewHex),
+                    ("Decrypt (d)", Action::ViewDecrypt),
+                ],
+                View::Help => &[],
+            };
+            let mut x = inner.x + 1;
+            let y = inner.bottom().saturating_sub(1);
+            for (label, action) in [
+                ("Up", Action::ScrollText(-10)),
+                ("Down", Action::ScrollText(10)),
+            ]
+            .iter()
+            .chain(options)
+            {
+                let width = label.len() as u16 + 4;
+                if x + width + 13 > inner.right() {
+                    break;
+                }
+                button(
+                    frame,
+                    app,
+                    Rect::new(x, y, width, 1),
+                    label,
+                    action.clone(),
+                    true,
+                );
+                x += width + 1;
+            }
+        }
+        Dialog::Open(text)
+        | Dialog::Bpf(text)
+        | Dialog::Export(text, _)
+        | Dialog::Find(text)
+        | Dialog::Comment(text)
+        | Dialog::Goto(text)
+        | Dialog::KeyLog(text) => {
+            let hint = match dialog {
+                Dialog::Open(_) => "Enter a PCAP/PCAPNG path. Opening begins a new session.",
+                Dialog::Bpf(_) => "Example: tcp port 443 · applies when you click Start again.",
+                Dialog::Export(..) => {
+                    "New file path; the extension picks the format:\n.pcap .pcapng (raw bytes) · .json .csv (decoded)"
+                }
+                Dialog::Find(_) => "Text (case-insensitive), or hex:de:ad:be:ef for bytes.",
+                Dialog::Comment(_) => "Comment for the selected packet. Empty removes it.",
+                Dialog::Goto(_) => "Packet number. A file reloads its window there if needed.",
+                _ => "Path of an SSLKEYLOGFILE key log. Empty unloads it.",
             };
             frame.render_widget(
                 Paragraph::new(hint).style(Style::default().fg(theme.muted)),
@@ -106,7 +167,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 theme,
             );
         }
-        Dialog::Interfaces { entries, selected } => {
+        Dialog::Interfaces {
+            entries,
+            selected,
+            checked,
+        } => {
             if entries.is_empty() {
                 frame.render_widget(
                     Paragraph::new("No capture interfaces found.")
@@ -133,7 +198,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     Style::default().fg(theme.text)
                 };
                 frame.render_widget(
-                    Paragraph::new(Line::styled(format!(" {}", safe_text(entry)), style)),
+                    Paragraph::new(Line::styled(
+                        format!(
+                            " [{}] {}",
+                            if checked.contains(&index) { 'x' } else { ' ' },
+                            safe_text(entry)
+                        ),
+                        style,
+                    )),
                     rect,
                 );
                 app.regions
@@ -143,7 +215,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
     let y = inner.bottom().saturating_sub(1);
-    if !matches!(dialog, Dialog::Help) {
+    if !matches!(dialog, Dialog::Help | Dialog::Text { .. }) {
         button(
             frame,
             app,

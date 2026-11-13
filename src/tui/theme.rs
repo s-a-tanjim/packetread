@@ -64,6 +64,17 @@ impl Theme {
             _ => "vivid",
         })
     }
+    /// A coloring-rule color name (see `profile::COLORS`).
+    pub fn rule(self, name: &str) -> Color {
+        match name {
+            "red" => self.red,
+            "green" => self.green,
+            "yellow" => self.yellow,
+            "cyan" => self.cyan,
+            "purple" => self.purple,
+            _ => self.muted,
+        }
+    }
     pub fn protocol(self, protocol: Protocol) -> Color {
         match protocol {
             Protocol::Tcp => self.cyan,

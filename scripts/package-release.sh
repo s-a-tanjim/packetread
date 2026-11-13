@@ -16,7 +16,9 @@ fi
 
 version="$(python3 scripts/release-version.py)"
 binary="target/${target}/release/packetread"
+helper="target/${target}/release/packetread-capture"
 test -x "$binary"
+test -x "$helper"
 test "$("$binary" --version)" = "packetread ${version}"
 stem="packetread-${version}-${target}"
 stage_dir="$(mktemp -d)"
@@ -24,6 +26,7 @@ trap 'rm -rf -- "$stage_dir"' EXIT
 mkdir -p "$stage_dir/$stem" dist
 mkdir "$stage_dir/$stem/docs"
 install -m755 "$binary" "$stage_dir/$stem/packetread"
+install -m755 "$helper" "$stage_dir/$stem/packetread-capture"
 install -m644 README.md Cargo.lock "$stage_dir/$stem/"
 install -m644 docs/DISTRIBUTION.md "$stage_dir/$stem/INSTALL.md"
 install -m644 docs/DISTRIBUTION.md "$stage_dir/$stem/docs/"
@@ -55,6 +58,7 @@ mkdir "$stage_dir/unpacked"
 tar -xzf "dist/${stem}.tar.gz" -C "$stage_dir/unpacked"
 unpacked="$stage_dir/unpacked/$stem/packetread"
 test -x "$unpacked"
+test -x "$stage_dir/unpacked/$stem/packetread-capture"
 test "$("$unpacked" --version)" = "packetread ${version}"
 for fixture in tests/fixtures/demo.pcap tests/fixtures/demo.pcapng; do
   summary="$("$unpacked" summary "$fixture")"

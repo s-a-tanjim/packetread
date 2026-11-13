@@ -3,8 +3,9 @@
 The demo starts with `packetread`, then opens `tests/fixtures/demo.pcap` through
 the application's Open dialog. The capture contains only synthetic traffic using
 documentation addresses. It shows packet navigation,
-protocol fields and their highlighted bytes, DNS and TCP display filters, keyboard
-help, and a command-line summary. No network access or capture privileges are
+protocol fields and their highlighted bytes, DNS and TCP display filters, a typed
+field filter, statistics, the flow diagram, keyboard help, and a command-line
+summary. No network access or capture privileges are
 needed to record it after the tools and Rust dependencies are installed.
 
 ## Prerequisites

@@ -1,7 +1,16 @@
+pub mod analysis;
+pub mod crypto;
 pub mod decode;
+pub mod export;
 pub mod filter;
+pub mod follow;
+pub mod graph;
+pub mod helper;
 pub mod ingest;
 pub mod offline;
+pub mod profile;
 pub mod session;
 pub mod source;
+pub mod stats;
+pub mod tls;
 pub mod tui;

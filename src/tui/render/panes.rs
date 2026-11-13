@@ -1,7 +1,8 @@
 use super::{bold, panel, scrollbar};
 use crate::{
     decode::{safe_text, Summary},
-    tui::app::{App, Pane},
+    session::Session,
+    tui::app::{App, Pane, TimeFormat},
 };
 use ratatui::{
     layout::Rect,
@@ -46,14 +47,27 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
     app.packet_offset = app.packet_offset.min(app.max_offset(Pane::Packets));
     let wide = inner.width >= 100;
     let endpoint_width = if wide { 26 } else { 16 };
+    let (time_label, time_width) = match app.time_format {
+        TimeFormat::Clock => ("TIME UTC", 15),
+        TimeFormat::Relative if app.time_reference.is_some() => ("SINCE REFERENCE", 15),
+        TimeFormat::Relative => ("SINCE FIRST", 15),
+        TimeFormat::Delta => ("SINCE PREVIOUS", 15),
+        TimeFormat::Date => ("DATE UTC", 19),
+    };
+    const COLUMN: usize = 18;
     let header = if wide {
+        let extra: String = app
+            .columns
+            .iter()
+            .map(|(title, ..)| format!("{:<COLUMN$} ", title.to_ascii_uppercase()))
+            .collect();
         format!(
-            "{:>7} {:>11} {:<26} {:<26} {:<7} {:>6}  INFO",
-            "NO.", "TIME", "SOURCE", "DESTINATION", "PROTO", "LEN"
+            " {:>7} {:>time_width$} {:<26} {:<26} {:<7} {:>6}  {extra}INFO",
+            "NO.", time_label, "SOURCE", "DESTINATION", "PROTO", "LEN"
         )
     } else {
         format!(
-            "{:>6} {:<16} {:<16} {:<6} {:>5}",
+            " {:>6} {:<16} {:<16} {:<6} {:>5}",
             "NO.", "SOURCE", "DESTINATION", "PROTO", "LEN"
         )
     };
@@ -62,25 +76,59 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
         Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
     );
     let mut lines = Vec::new();
-    for id in app
-        .session
-        .visible()
+    let names = app.resolve.then_some(&app.session);
+    let first = app
+        .time_reference
+        .map(|(_, time)| time)
+        .or_else(|| app.session.packets().next().map(|p| p.timestamp_ns))
+        .unwrap_or(0);
+    let shift = app.time_shift_ns;
+    let visible = app.session.visible();
+    for (index, id) in visible
         .iter()
+        .enumerate()
         .skip(app.packet_offset)
         .take(rows.height as usize)
     {
         if let Some(packet) = app.session.packet(*id) {
             let summary = &packet.summary;
-            let source = fit(&endpoint(summary, true), endpoint_width);
-            let destination = fit(&endpoint(summary, false), endpoint_width);
-            let time = packet.timestamp_ns.rem_euclid(86_400_000_000_000) as f64 / 1_000_000_000.0;
+            let source = fit(&endpoint(summary, true, names), endpoint_width);
+            let destination = fit(&endpoint(summary, false, names), endpoint_width);
+            let seconds = |ns: i128| format!("{:.6}", ns as f64 / 1e9);
+            let time = match app.time_format {
+                TimeFormat::Clock => clock(packet.timestamp_ns + shift).1,
+                TimeFormat::Date => {
+                    let (date, time) = clock(packet.timestamp_ns + shift);
+                    format!("{date} {}", &time[..8])
+                }
+                TimeFormat::Relative => seconds(packet.timestamp_ns - first),
+                TimeFormat::Delta => {
+                    let previous = index
+                        .checked_sub(1)
+                        .and_then(|i| app.session.packet(visible[i]));
+                    seconds(previous.map_or(0, |p| packet.timestamp_ns - p.timestamp_ns))
+                }
+            };
+            let mark = match (packet.mark, packet.comment.is_some()) {
+                _ if app.time_reference.is_some_and(|(id, _)| id == packet.id) => 'R',
+                (true, _) => '*',
+                (false, true) => '#',
+                _ => ' ',
+            };
+            // The first matching coloring rule colors the row's text.
+            let rule = app
+                .colors
+                .iter()
+                .find(|(_, _, filter)| filter.matches(packet))
+                .map(|(color, ..)| theme.rule(color));
+            let text_color = rule.unwrap_or(theme.text);
             let lead = if wide {
-                format!("{:>7} {:>11.6} {source} {destination} ", id, time)
+                format!("{mark}{id:>7} {time:>time_width$} {source} {destination} ")
             } else {
-                format!("{:>6} {source} {destination} ", id)
+                format!("{mark}{:>6} {source} {destination} ", id)
             };
             let mut spans = vec![
-                Span::styled(lead, Style::default().fg(theme.text)),
+                Span::styled(lead, Style::default().fg(text_color)),
                 Span::styled(
                     format!("{:<7}", summary.protocol.name()),
                     bold(theme.protocol(summary.protocol)),
@@ -99,9 +147,20 @@ pub fn packets(frame: &mut Frame, app: &mut App, area: Rect) {
                     },
                     bold(theme.yellow),
                 ));
+                for (_, _, field) in &app.columns {
+                    let value = field.value(packet).unwrap_or_default();
+                    spans.push(Span::styled(
+                        format!("{} ", fit(&safe_text(&value), COLUMN)),
+                        Style::default().fg(theme.green),
+                    ));
+                }
                 spans.push(Span::styled(
                     safe_text(&summary.info),
-                    Style::default().fg(theme.text),
+                    Style::default().fg(match rule {
+                        Some(color) => color,
+                        None if summary.diag != 0 => theme.yellow,
+                        None => theme.text,
+                    }),
                 ));
             }
             if app.session.selected() == Some(*id) {
@@ -181,7 +240,9 @@ pub fn details(frame: &mut Frame, app: &mut App, area: Rect) {
             (
                 format!(
                     " {arrow} {}  [{}..{}]",
-                    layer.label, layer.range.start, layer.range.end
+                    safe_text(&layer.label),
+                    layer.range.start,
+                    layer.range.end
                 ),
                 bold(theme.green),
             )
@@ -208,10 +269,18 @@ pub fn details(frame: &mut Frame, app: &mut App, area: Rect) {
 
 pub fn bytes(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = app.theme;
+    let reassembled = app
+        .session
+        .selected_packet()
+        .is_some_and(|p| p.reassembled.is_some());
     let inner = panel(
         frame,
         area,
-        " HEX / ASCII · selected field highlighted ",
+        if reassembled {
+            " HEX / ASCII · reassembled IP datagram "
+        } else {
+            " HEX / ASCII · selected field highlighted "
+        },
         if app.pane == Pane::Bytes {
             theme.purple
         } else {
@@ -231,12 +300,12 @@ pub fn bytes(frame: &mut Frame, app: &mut App, area: Rect) {
     let count = app
         .session
         .selected_packet()
-        .map_or(0, |p| p.bytes.len().div_ceil(width));
+        .map_or(0, |p| p.view().0.len().div_ceil(width));
     app.byte_offset = app
         .byte_offset
         .min(count.saturating_sub(rows_area.height as usize));
     let mut lines = Vec::new();
-    if let Some(packet) = app.session.selected_packet() {
+    if let Some(bytes) = app.session.selected_packet().map(|p| p.view().0) {
         for line_index in app.byte_offset..(app.byte_offset + rows_area.height as usize).min(count)
         {
             let start = line_index * width;
@@ -252,15 +321,14 @@ pub fn bytes(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(theme.text)
                 };
                 spans.push(Span::styled(
-                    packet
-                        .bytes
+                    bytes
                         .get(index)
                         .map_or_else(|| "   ".into(), |b| format!("{b:02x} ")),
                     style,
                 ));
             }
             spans.push(Span::raw(" "));
-            for (column, byte) in packet.bytes[start..packet.bytes.len().min(start + width)]
+            for (column, byte) in bytes[start..bytes.len().min(start + width)]
                 .iter()
                 .enumerate()
             {
@@ -287,18 +355,49 @@ pub fn bytes(frame: &mut Frame, app: &mut App, area: Rect) {
     scrollbar(frame, app, Pane::Bytes, inner, count, offset);
 }
 
-fn endpoint(summary: &Summary, source: bool) -> String {
+fn endpoint(summary: &Summary, source: bool, names: Option<&Session>) -> String {
     let (address, port) = if source {
         (summary.src, summary.src_port)
     } else {
         (summary.dst, summary.dst_port)
     };
-    match (address, port) {
-        (Some(address), Some(port)) if address.is_ipv6() => format!("[{address}]:{port}"),
-        (Some(address), Some(port)) => format!("{address}:{port}"),
-        (Some(address), _) => address.to_string(),
+    let name = address.and_then(|address| names?.name(&address));
+    match (address, port, name) {
+        (_, Some(port), Some(name)) => format!("{}:{port}", safe_text(name)),
+        (_, None, Some(name)) => safe_text(name),
+        (Some(address), Some(port), _) if address.is_ipv6() => format!("[{address}]:{port}"),
+        (Some(address), Some(port), _) => format!("{address}:{port}"),
+        (Some(address), _, _) => address.to_string(),
         _ => "—".into(),
     }
+}
+
+/// UTC date (`YYYY-MM-DD`) and time of day (`HH:MM:SS.ffffff`).
+fn clock(timestamp_ns: i128) -> (String, String) {
+    let seconds = timestamp_ns.div_euclid(1_000_000_000);
+    let micros = timestamp_ns.rem_euclid(1_000_000_000) / 1000;
+    let (days, day) = (seconds.div_euclid(86_400), seconds.rem_euclid(86_400));
+    // Civil date from a day count (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (
+        doy - (153 * mp + 2) / 5 + 1,
+        if mp < 10 { mp + 3 } else { mp - 9 },
+    );
+    let year = yoe + era * 400 + i128::from(m <= 2);
+    (
+        format!("{year:04}-{m:02}-{d:02}"),
+        format!(
+            "{:02}:{:02}:{:02}.{micros:06}",
+            day / 3600,
+            day / 60 % 60,
+            day % 60
+        ),
+    )
 }
 
 fn fit(text: &str, width: usize) -> String {
@@ -312,5 +411,23 @@ fn fit(text: &str, width: usize) -> String {
         )
     } else {
         format!("{text}{}", " ".repeat(width - length))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn clock_formats_utc_dates() {
+        let stamp = |ns: i128| super::clock(ns);
+        assert_eq!(stamp(0), ("1970-01-01".into(), "00:00:00.000000".into()));
+        assert_eq!(
+            stamp(1_700_000_000_012_500_000),
+            ("2023-11-14".into(), "22:13:20.012500".into())
+        );
+        assert_eq!(stamp(951_782_400_000_000_000).0, "2000-02-29");
+        assert_eq!(
+            stamp(-1_000_000_000),
+            ("1969-12-31".into(), "23:59:59.000000".into())
+        );
     }
 }

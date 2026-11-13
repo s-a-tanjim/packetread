@@ -1,6 +1,6 @@
 //! ARP, IPv4 and IPv6. Each IP parser returns the transport protocol number
 //! and the byte range the transport decoder may read.
-use super::{be16, ipv4, ipv6, Decoder, Protocol};
+use super::{be16, be32, checksum_ok, ipv4, ipv6, Decoder, Fragment, Protocol};
 
 type Transport = (u8, usize, usize);
 
@@ -9,6 +9,22 @@ impl Decoder<'_> {
         let transport = match ethertype {
             0x0806 => {
                 self.arp(start);
+                None
+            }
+            0x88cc => {
+                self.lldp(start);
+                None
+            }
+            0x888e => {
+                self.eapol(start);
+                None
+            }
+            0x8847 | 0x8848 => {
+                self.mpls(start);
+                None
+            }
+            0x8863 | 0x8864 => {
+                self.pppoe(start);
                 None
             }
             0x0800 | 0x86dd if start >= self.bytes.len() => {
@@ -79,10 +95,33 @@ impl Decoder<'_> {
         self.field(start + 8, start + 9, || {
             format!("TTL: {}", bytes[start + 8])
         });
+        self.field(start + 10, start + 12, || {
+            format!(
+                "Header checksum: 0x{:04x} ({})",
+                be16(bytes, start + 10),
+                if checksum_ok(&[&bytes[start..start + header_len]]) {
+                    "correct"
+                } else {
+                    "incorrect"
+                }
+            )
+        });
         self.field(start + 12, start + 16, || format!("Source: {src}"));
         self.field(start + 16, start + 20, || format!("Destination: {dst}"));
-        if be16(bytes, start + 6) & 0x3fff != 0 {
-            self.summary.info = "IP fragment · reassembly unavailable".into();
+        self.summary.ttl = Some(bytes[start + 8]);
+        let fragment = be16(bytes, start + 6);
+        if fragment & 0x3fff != 0 {
+            let offset = u32::from(fragment & 0x1fff) * 8;
+            let id = u32::from(be16(bytes, start + 4));
+            self.summary.info = format!("IPv4 fragment · id 0x{id:04x} · offset {offset}");
+            self.summary.fragment = Some(Fragment {
+                id,
+                offset,
+                more: fragment & 0x2000 != 0,
+                protocol: bytes[start + 9],
+                start: (start + header_len) as u32,
+                end: (start + total_len).min(bytes.len()) as u32,
+            });
             return None;
         }
         Some((
@@ -113,6 +152,7 @@ impl Decoder<'_> {
         self.field(start + 7, start + 8, || {
             format!("Hop limit: {}", bytes[start + 7])
         });
+        self.summary.ttl = Some(bytes[start + 7]);
         let length = usize::from(be16(bytes, start + 4));
         if length == 0 {
             self.warn("Empty IPv6 payload or unsupported jumbogram");
@@ -140,8 +180,19 @@ impl Decoder<'_> {
                 return None;
             }
             self.layer("IPv6 extension", cursor, cursor + length);
-            if protocol == 44 && be16(bytes, cursor + 2) & 0xfff9 != 0 {
-                self.summary.info = "IPv6 fragment · reassembly unavailable".into();
+            let fragment = be16(bytes, cursor + 2);
+            if protocol == 44 && fragment & 0xfff9 != 0 {
+                let offset = u32::from(fragment & 0xfff8);
+                let id = be32(bytes, cursor + 4);
+                self.summary.info = format!("IPv6 fragment · id 0x{id:08x} · offset {offset}");
+                self.summary.fragment = Some(Fragment {
+                    id,
+                    offset,
+                    more: fragment & 1 != 0,
+                    protocol: bytes[cursor],
+                    start: (cursor + 8) as u32,
+                    end: end as u32,
+                });
                 return None;
             }
             protocol = bytes[cursor];

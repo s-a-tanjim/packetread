@@ -101,8 +101,13 @@ def session():
         keys("1/proto=dns\r", 2.5)        # Narrow eleven packets to two.
         keys("j", 1.5)                    # Inspect the response.
         keys("/\x15proto=tcp port=443\r", 2.5)
+        keys('/\x15dns.qry.name contains "example"\r', 2.5)  # Typed field filter.
         keys("/\x15\r", 0.5)              # Clear the filter.
         keys("g", 1)
+        keys("S", 2.5)                    # Statistics.
+        keys("\x1b", 0.5)
+        keys("D", 2.5)                    # Flow diagram between hosts.
+        keys("\x1b", 0.5)
         keys("?", 2)
         keys("\x1b", 0.5)
         keys("q", 0)

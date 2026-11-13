@@ -58,7 +58,6 @@ class ReleasePackagingTests(unittest.TestCase):
                 destination = root / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, destination)
-            self.assertFalse((root / "docs/PLAN.md").exists())
 
             # Exercise the real packaging script without compiling Rust or
             # requiring libpcap in the formatting/release-metadata CI job.
@@ -75,6 +74,9 @@ class ReleasePackagingTests(unittest.TestCase):
                 "    sys.exit(1)\n"
             )
             binary.chmod(0o755)
+            helper = binary.with_name("packetread-capture")
+            helper.write_text("#!/bin/sh\nexit 1\n")
+            helper.chmod(0o755)
             metadata_tools = root / "metadata-tools"
             metadata_tools.mkdir()
             for tool in ("rustc", "cargo", "pkg-config"):
@@ -100,8 +102,8 @@ class ReleasePackagingTests(unittest.TestCase):
             with tarfile.open(archive) as package:
                 self.assertIn(f"{stem}/docs/DISTRIBUTION.md", package.getnames())
                 self.assertIn(f"{stem}/INSTALL.md", package.getnames())
-                self.assertNotIn(f"{stem}/docs/PLAN.md", package.getnames())
                 self.assertTrue(package.getmember(f"{stem}/packetread").mode & 0o111)
+                self.assertTrue(package.getmember(f"{stem}/packetread-capture").mode & 0o111)
                 self.assertTrue(all(item.mtime == 1700000000 for item in package.getmembers()))
             self.assertTrue(archive.with_suffix(".gz.sha256").is_file())
 

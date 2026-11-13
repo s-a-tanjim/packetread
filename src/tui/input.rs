@@ -1,4 +1,4 @@
-use super::app::{contains, Action, App, Dialog, Drag, Pane, TextInput};
+use super::app::{contains, Action, App, Dialog, Drag, Pane, TextInput, View};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -25,7 +25,15 @@ pub fn handle(app: &mut App, event: Event) {
 
 fn active_input(app: &mut App) -> Option<&mut TextInput> {
     match &mut app.dialog {
-        Some(Dialog::Open(input) | Dialog::Bpf(input)) => Some(input),
+        Some(
+            Dialog::Open(input)
+            | Dialog::Bpf(input)
+            | Dialog::Export(input, _)
+            | Dialog::Find(input)
+            | Dialog::Comment(input)
+            | Dialog::Goto(input)
+            | Dialog::KeyLog(input),
+        ) => Some(input),
         None if app.editing_filter => Some(&mut app.filter),
         _ => None,
     }
@@ -49,6 +57,10 @@ fn key_event(app: &mut App, key: KeyEvent) {
             } else {
                 Action::ApplyFilter
             });
+            return;
+        }
+        if key.code == KeyCode::Tab && app.editing_filter && app.dialog.is_none() {
+            app.complete_filter();
             return;
         }
         if let Some(input) = active_input(app) {
@@ -82,14 +94,40 @@ fn key_event(app: &mut App, key: KeyEvent) {
             app.apply(Action::ApplyDialog);
             return;
         }
-        if let Some(Dialog::Interfaces { entries, selected }) = &mut app.dialog {
-            match key.code {
+        match &mut app.dialog {
+            Some(Dialog::Interfaces {
+                entries,
+                selected,
+                checked,
+            }) => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *selected = (*selected + 1).min(entries.len().saturating_sub(1))
                 }
                 KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+                KeyCode::Char(' ') if !checked.remove(selected) => {
+                    checked.insert(*selected);
+                }
                 _ => {}
+            },
+            Some(Dialog::Text { view, .. }) => {
+                let action = match (key.code, *view) {
+                    (KeyCode::Down | KeyCode::Char('j'), _) => Action::ScrollText(1),
+                    (KeyCode::Up | KeyCode::Char('k'), _) => Action::ScrollText(-1),
+                    (KeyCode::PageDown | KeyCode::Char(' '), _) => Action::ScrollText(20),
+                    (KeyCode::PageUp, _) => Action::ScrollText(-20),
+                    (KeyCode::Home | KeyCode::Char('g'), _) => Action::ScrollText(isize::MIN / 2),
+                    (KeyCode::End | KeyCode::Char('G'), _) => Action::ScrollText(isize::MAX / 2),
+                    (KeyCode::Char('q'), _) => Action::CloseDialog,
+                    (KeyCode::Char('u'), View::Stats) => Action::ViewUnit,
+                    (KeyCode::Char('+' | '='), View::Stats) => Action::ViewInterval(true),
+                    (KeyCode::Char('-'), View::Stats) => Action::ViewInterval(false),
+                    (KeyCode::Char('h'), View::Follow) => Action::ViewHex,
+                    (KeyCode::Char('d'), View::Follow) => Action::ViewDecrypt,
+                    _ => return,
+                };
+                app.apply(action);
             }
+            _ => {}
         }
         return;
     }
@@ -102,6 +140,28 @@ fn key_event(app: &mut App, key: KeyEvent) {
         KeyCode::Char('r') => Action::Start,
         KeyCode::Char(' ') => Action::Follow,
         KeyCode::Char('n') => Action::NextWindow,
+        KeyCode::Char('p') => Action::PrevWindow,
+        KeyCode::Char('w') => Action::Export(false),
+        KeyCode::Char('W') => Action::Export(true),
+        KeyCode::Char('f') => Action::Find,
+        KeyCode::F(3) | KeyCode::Char('.') => Action::FindNext(true),
+        KeyCode::Char(',') => Action::FindNext(false),
+        KeyCode::Char('m') => Action::Mark,
+        KeyCode::Char('c') => Action::Comment,
+        KeyCode::Char(':') => Action::Goto,
+        KeyCode::Char('S') => Action::Stats,
+        KeyCode::Char('F') => Action::FollowStream,
+        KeyCode::Char('K') => Action::KeyLog,
+        KeyCode::Char('P') => Action::SaveProfile,
+        KeyCode::Char('T') => Action::TimeFormat,
+        KeyCode::Char('N') => Action::Resolve,
+        KeyCode::Char('a') => Action::ApplyAsFilter,
+        KeyCode::Char('E') => Action::Expert,
+        KeyCode::Char('R') => Action::TimeReference,
+        KeyCode::Char('Y') => Action::Graph,
+        KeyCode::Char('D') => Action::FlowDiagram,
+        KeyCode::Char('V') => Action::Voip,
+        KeyCode::F(number @ 5..=12) => Action::SavedFilter(usize::from(number - 5)),
         KeyCode::Char('t') => Action::Theme,
         KeyCode::Char('b') => Action::Bpf,
         KeyCode::Char('/') => Action::Filter,
@@ -181,10 +241,17 @@ fn mouse_event(app: &mut App, mouse: MouseEvent) {
             } else {
                 -3
             };
-            if let Some(Dialog::Interfaces { entries, selected }) = &mut app.dialog {
+            if let Some(Dialog::Interfaces {
+                entries, selected, ..
+            }) = &mut app.dialog
+            {
                 *selected = selected
                     .saturating_add_signed(delta)
                     .min(entries.len().saturating_sub(1));
+                return;
+            }
+            if matches!(app.dialog, Some(Dialog::Text { .. })) {
+                app.apply(Action::ScrollText(delta));
                 return;
             }
             if app.dialog.is_some() {

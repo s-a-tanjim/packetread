@@ -1,6 +1,6 @@
 use packetread::{
     decode::{decode, details, Protocol},
-    source::{SourceSpec, Worker},
+    source::{Seek, SourceSpec, Worker},
 };
 use std::{path::PathBuf, process::Command, time::Duration};
 
@@ -97,7 +97,7 @@ fn reads_linux_cooked_headers_and_ipv6_extensions() {
 
 #[test]
 fn worker_delivers_the_complete_offline_capture() {
-    let worker = Worker::start(SourceSpec::File(fixture("demo.pcap"))).unwrap();
+    let worker = Worker::start(SourceSpec::File(fixture("demo.pcap")), Seek::default()).unwrap();
     let mut ids = Vec::new();
     loop {
         match worker.packets.recv_timeout(Duration::from_secs(2)) {

@@ -1,9 +1,39 @@
 use super::{invalid, MAX_BLOCK_BYTES, MAX_PACKET_BYTES};
 use crate::decode::Packet;
-use pcap_parser::{Block, OptionCode, PcapBlockOwned};
-use std::io;
+use pcap_parser::{Block, OptionCode, PcapBlockOwned, PcapNGOption};
+use std::{
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 const MAX_INTERFACES: usize = 1024;
+const MAX_NAMES: usize = 10_000;
+
+/// Descriptive PCAPNG metadata. All text comes from the file: pass it
+/// through `decode::safe_text` before showing it.
+#[derive(Clone, Debug, Default)]
+pub struct Metadata {
+    /// Section header options, such as the capturing application.
+    pub section: Vec<String>,
+    /// One description per interface, in interface order.
+    pub interfaces: Vec<String>,
+    /// Host names from name-resolution blocks.
+    pub names: Vec<(IpAddr, String)>,
+}
+
+/// The text of the options whose code is in `wanted`, labelled.
+fn option_text(options: &[PcapNGOption<'_>], wanted: &[(u16, &str)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for option in options.iter().take(64) {
+        let Some((_, label)) = wanted.iter().find(|(code, _)| *code == option.code.0) else {
+            continue;
+        };
+        let length = usize::from(option.len).min(256).min(option.value.len());
+        let text = String::from_utf8_lossy(&option.value[..length]);
+        out.push(format!("{label}: {}", text.trim_matches('\0')));
+    }
+    out
+}
 
 struct Interface {
     link: i32,
@@ -25,6 +55,7 @@ pub(super) struct CaptureState {
     big_endian: bool,
     pcapng: Option<bool>,
     next_id: u64,
+    pub metadata: Metadata,
 }
 
 impl CaptureState {
@@ -99,6 +130,17 @@ impl CaptureState {
                 }
                 self.big_endian = header.big_endian();
                 self.interfaces.clear();
+                if self.metadata.section.len() < 16 {
+                    self.metadata.section.extend(option_text(
+                        &header.options,
+                        &[
+                            (1, "Comment"),
+                            (2, "Hardware"),
+                            (3, "Operating system"),
+                            (4, "Application"),
+                        ],
+                    ));
+                }
                 None
             }
             PcapBlockOwned::NG(Block::InterfaceDescription(interface)) => {
@@ -138,6 +180,12 @@ impl CaptureState {
                         _ => {}
                     }
                 }
+                let mut description = vec![format!("link type {}", interface.linktype.0)];
+                description.extend(option_text(
+                    &interface.options,
+                    &[(2, "name"), (3, "description"), (12, "operating system")],
+                ));
+                self.metadata.interfaces.push(description.join(" · "));
                 self.interfaces.push(Interface {
                     link: interface.linktype.0,
                     snaplen: interface.snaplen,
@@ -154,7 +202,14 @@ impl CaptureState {
                     .data
                     .get(..packet.caplen as usize)
                     .ok_or_else(|| invalid("Truncated captured packet"))?;
-                Some(self.packet(packet.if_id, timestamp, packet.origlen, data)?)
+                let mut decoded = self.packet(packet.if_id, timestamp, packet.origlen, data)?;
+                decoded.comment = packet
+                    .options
+                    .iter()
+                    .find(|option| option.code == OptionCode::Comment)
+                    .and_then(|option| option.value.get(..usize::from(option.len).min(4096)))
+                    .map(|comment| String::from_utf8_lossy(comment).into_owned());
+                Some(decoded)
             }
             PcapBlockOwned::NG(Block::SimplePacket(packet)) => {
                 let snaplen = self.interface(0)?.snaplen;
@@ -184,6 +239,33 @@ impl CaptureState {
                 } else {
                     None
                 }
+            }
+            PcapBlockOwned::NG(Block::NameResolution(block)) => {
+                for record in block.nr.iter().take(MAX_NAMES) {
+                    let value = record.record_value;
+                    let (address, names) = match (record.record_type.0, value.len()) {
+                        (1, 5..) => (
+                            IpAddr::V4(Ipv4Addr::new(value[0], value[1], value[2], value[3])),
+                            &value[4..],
+                        ),
+                        (2, 17..) => {
+                            let mut octets = [0u8; 16];
+                            octets.copy_from_slice(&value[..16]);
+                            (IpAddr::V6(Ipv6Addr::from(octets)), &value[16..])
+                        }
+                        _ => continue,
+                    };
+                    let name = names.split(|b| *b == 0).next().unwrap_or_default();
+                    if !name.is_empty()
+                        && name.len() <= 255
+                        && self.metadata.names.len() < MAX_NAMES
+                    {
+                        self.metadata
+                            .names
+                            .push((address, String::from_utf8_lossy(name).into_owned()));
+                    }
+                }
+                None
             }
             PcapBlockOwned::NG(_) => None,
         };

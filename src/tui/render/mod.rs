@@ -40,9 +40,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
+    let entries = toolbar_entries(app);
     let chunks = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Length(toolbar_rows(&entries, area.width)),
         Constraint::Length(5),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -56,6 +57,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .map_or_else(|| "no source".into(), |s| safe_text(&s.label()));
     let state = if app.ingest.status.error.is_some() {
         "ERROR"
+    } else if app.searching() {
+        "SEARCHING"
+    } else if app.ingest.status.limit_reached {
+        "LIMIT REACHED"
     } else if app.ingest.window_full {
         "WINDOW FULL"
     } else if !app.ingest.has_worker() {
@@ -82,7 +87,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])),
         chunks[0],
     );
-    toolbar(frame, app, chunks[1]);
+    toolbar(frame, app, chunks[1], entries);
     metrics(frame, app, chunks[2]);
     filter(frame, app, chunks[3]);
     tabs(frame, app, chunks[4]);
@@ -155,7 +160,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
         ),
         Line::styled(
-            " / filter · Tab pane · ↑↓/jk move · Space auto-scroll · ? help",
+            " / filter · a filter on selection · f find · m mark · w save · S stats · E expert · F stream · ? help",
             Style::default().fg(theme.muted),
         ),
     ];
@@ -165,14 +170,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
+fn toolbar_entries(app: &App) -> Vec<(&'static str, Action, bool)> {
     let active = app.ingest.has_worker() && !app.ingest.status.done;
     let live = app.source.as_ref().is_some_and(|s| s.is_live());
-    let entries = [
+    let any = !app.session.is_empty();
+    vec![
         ("Open", Action::Open, true),
         ("Interfaces", Action::Interfaces, true),
         ("Start", Action::Start, !active),
         ("Stop", Action::Stop, active),
+        ("Prev", Action::PrevWindow, !live && app.source.is_some()),
         ("Next", Action::NextWindow, app.ingest.window_full),
         (
             if app.session.follow() {
@@ -184,29 +191,58 @@ fn toolbar(frame: &mut Frame, app: &mut App, area: Rect) {
             true,
         ),
         ("BPF", Action::Bpf, live),
+        ("Find", Action::Find, any),
+        ("Save", Action::Export(false), any),
+        ("Stats", Action::Stats, any),
+        ("Stream", Action::FollowStream, any),
         ("Theme", Action::Theme, true),
         ("Help", Action::Help, true),
         ("Quit", Action::Quit, true),
-    ];
-    let (mut x, mut y) = (area.x, area.y);
-    for (label, action, enabled) in entries {
-        let width = Line::raw(label).width() as u16 + 4;
-        if x + width > area.right() {
-            x = area.x;
-            y += 1;
-        }
-        if y >= area.bottom() {
+    ]
+}
+
+/// Positions of the wrapped toolbar buttons, relative to the toolbar origin.
+fn toolbar_layout(entries: &[(&'static str, Action, bool)], width: u16) -> Vec<(u16, u16, u16)> {
+    let (mut x, mut y) = (0, 0);
+    entries
+        .iter()
+        .map(|(label, _, _)| {
+            let button = Line::raw(*label).width() as u16 + 4;
+            if x > 0 && x + button > width {
+                (x, y) = (0, y + 1);
+            }
+            x += button + 1;
+            (x - button - 1, y, button)
+        })
+        .collect()
+}
+
+fn toolbar_rows(entries: &[(&'static str, Action, bool)], width: u16) -> u16 {
+    let last = toolbar_layout(entries, width)
+        .last()
+        .map_or(0, |(_, y, _)| *y);
+    (last + 1).clamp(2, 4)
+}
+
+fn toolbar(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    entries: Vec<(&'static str, Action, bool)>,
+) {
+    let layout = toolbar_layout(&entries, area.width);
+    for ((label, action, enabled), (x, y, width)) in entries.into_iter().zip(layout) {
+        if y >= area.height {
             break;
         }
         button(
             frame,
             app,
-            Rect::new(x, y, width, 1),
+            Rect::new(area.x + x, area.y + y, width.min(area.width), 1),
             label,
             action,
             enabled,
         );
-        x += width + 1;
     }
 }
 
@@ -226,7 +262,15 @@ fn metrics(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Line::from(format!("{} visible", app.session.visible().len())),
         Line::styled(
-            format!("{} retained", app.session.len()),
+            if app.ingest.status.saved > 0 {
+                format!(
+                    "{} retained · {} saved",
+                    app.session.len(),
+                    app.ingest.status.saved
+                )
+            } else {
+                format!("{} retained", app.session.len())
+            },
             Style::default().fg(theme.muted),
         ),
     ];
@@ -306,13 +350,41 @@ fn filter(frame: &mut Frame, app: &mut App, area: Rect) {
     let title = if app.session.filtering() {
         " DISPLAY FILTER · rebuilding… "
     } else {
-        " DISPLAY FILTER · proto=tcp port=443 "
+        " DISPLAY FILTER · proto=tcp port=443 · (a or b) and not c "
     };
     let inner = panel(frame, area, title, color, theme);
+    // Saved filters sit left of Apply while the input keeps half the bar.
+    let mut reserved = 10;
+    let saved: Vec<(usize, String)> = app
+        .buttons
+        .iter()
+        .enumerate()
+        .map(|(index, (label, _))| (index, label.clone()))
+        .collect();
+    for (index, label) in saved {
+        let width = label.chars().count() as u16 + 5;
+        if reserved + width > inner.width / 2 {
+            break;
+        }
+        reserved += width;
+        button(
+            frame,
+            app,
+            Rect::new(
+                inner.right().saturating_sub(reserved),
+                inner.y,
+                width - 1,
+                1,
+            ),
+            &label,
+            Action::SavedFilter(index),
+            true,
+        );
+    }
     let input_area = Rect::new(
         inner.x,
         inner.y,
-        inner.width.saturating_sub(10),
+        inner.width.saturating_sub(reserved),
         inner.height,
     );
     app.regions.buttons.push((input_area, Action::Filter));
@@ -400,15 +472,7 @@ pub(super) fn panel(
 pub(super) fn bold(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
-pub(super) fn size(bytes: u64) -> String {
-    if bytes >= 1024 * 1024 {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
-}
+pub(super) use crate::stats::size;
 
 pub(super) fn input(frame: &mut Frame, area: Rect, input: &TextInput, focused: bool, theme: Theme) {
     if area.width == 0 || area.height == 0 {

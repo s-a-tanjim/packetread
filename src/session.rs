@@ -1,6 +1,10 @@
-use crate::{decode::Packet, filter::Filter};
+use crate::{
+    decode::{Packet, Protocol},
+    filter::Filter,
+};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
+    net::IpAddr,
     time::{Duration, Instant},
 };
 
@@ -19,7 +23,22 @@ pub struct Session {
     filter: Filter,
     scan_after: Option<u64>,
     filtering: bool,
+    // Marks and comments by packet ID; they survive file-window changes.
+    annotations: BTreeMap<u64, (bool, Option<String>)>,
+    // Host names learned from DNS answers in the capture.
+    names: HashMap<IpAddr, String>,
 }
+
+/// The queried name and the addresses it resolved to, from a DNS response
+/// summary such as `Response A example.com → www.example.com, 192.0.2.7`.
+fn dns_answers(info: &str) -> Option<(&str, Vec<IpAddr>)> {
+    let (question, answers) = info.split_once("Response ")?.1.split_once(" → ")?;
+    let answers = answers.split(" · ").next()?;
+    let addresses: Vec<_> = answers.split(", ").filter_map(|a| a.parse().ok()).collect();
+    Some((question.rsplit(' ').next()?, addresses)).filter(|(_, a)| !a.is_empty())
+}
+
+const MAX_ANNOTATIONS: usize = 10_000;
 
 impl Session {
     pub fn new(byte_limit: usize, packet_limit: usize) -> Self {
@@ -36,6 +55,8 @@ impl Session {
             filter: Filter::default(),
             scan_after: None,
             filtering: false,
+            annotations: BTreeMap::new(),
+            names: HashMap::new(),
         }
     }
     /// Forgets every packet and counter; keeps the limits and the filter.
@@ -70,6 +91,21 @@ impl Session {
     pub fn byte_limit(&self) -> usize {
         self.byte_limit
     }
+    pub fn packet_limit(&self) -> usize {
+        self.packet_limit
+    }
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+    /// Selects a displayed packet by ID.
+    pub fn select_id(&mut self, id: u64) -> bool {
+        let found = self.visible.binary_search(&id).is_ok();
+        if found {
+            self.selected = Some(id);
+            self.follow = false;
+        }
+        found
+    }
     pub fn evicted(&self) -> u64 {
         self.evicted
     }
@@ -89,7 +125,26 @@ impl Session {
         self.len() < self.packet_limit
             && self.bytes.saturating_add(packet.memory_size()) <= self.byte_limit
     }
-    pub fn insert(&mut self, packet: Packet) {
+    /// Host name a DNS answer in this session gave for `address`.
+    pub fn name(&self, address: &IpAddr) -> Option<&str> {
+        self.names.get(address).map(String::as_str)
+    }
+    pub fn insert(&mut self, mut packet: Packet) {
+        if packet.summary.protocol == Protocol::Dns {
+            if let Some((name, addresses)) = dns_answers(&packet.summary.info) {
+                for address in addresses {
+                    if self.names.len() < 10_000 || self.names.contains_key(&address) {
+                        self.names.insert(address, name.to_string());
+                    }
+                }
+            }
+        }
+        if let Some((mark, comment)) = self.annotations.get(&packet.id) {
+            packet.mark = *mark;
+            if comment.is_some() {
+                packet.comment.clone_from(comment);
+            }
+        }
         if packet.memory_size() > self.byte_limit {
             self.notice = Some("Packet exceeds storage budget".into());
             return;
@@ -100,7 +155,7 @@ impl Session {
         let id = packet.id;
         self.bytes += packet.memory_size();
         // During a filter rebuild the incremental scanner also handles new arrivals.
-        if !self.filtering && self.filter.matches(&packet.summary) {
+        if !self.filtering && self.filter.matches(&packet) {
             self.visible.push_back(id);
             if self.follow || self.selected.is_none() {
                 self.selected = Some(id);
@@ -121,6 +176,7 @@ impl Session {
             self.evicted += 1;
         }
     }
+    /// Empties the retained window; counters, filter and annotations stay.
     pub fn next_window(&mut self) {
         self.packets.clear();
         self.visible.clear();
@@ -128,7 +184,71 @@ impl Session {
         self.selected = None;
         self.scan_after = None;
         self.filtering = false;
-        self.notice = Some("Loading next file window".into());
+        self.notice = Some("Loading file window".into());
+    }
+    /// Retained packets, oldest first.
+    pub fn packets(&self) -> impl Iterator<Item = &Packet> {
+        self.packets.values()
+    }
+    /// Packets matching the display filter, oldest first.
+    pub fn visible_packets(&self) -> impl Iterator<Item = &Packet> {
+        self.visible.iter().filter_map(|id| self.packets.get(id))
+    }
+    pub fn last_id(&self) -> Option<u64> {
+        self.packets.keys().next_back().copied()
+    }
+    /// Changes the selected packet's mark and/or comment. A changed packet
+    /// stays in the view until the filter is applied again.
+    pub fn annotate(&mut self, mark: Option<bool>, comment: Option<Option<String>>) -> bool {
+        let Some(packet) = self.selected.and_then(|id| self.packets.get_mut(&id)) else {
+            return false;
+        };
+        self.bytes -= packet.memory_size();
+        if let Some(mark) = mark {
+            packet.mark = mark;
+        }
+        if let Some(comment) = comment {
+            packet.comment = comment;
+        }
+        self.bytes += packet.memory_size();
+        if packet.mark || packet.comment.is_some() {
+            if self.annotations.len() < MAX_ANNOTATIONS || self.annotations.contains_key(&packet.id)
+            {
+                self.annotations
+                    .insert(packet.id, (packet.mark, packet.comment.clone()));
+            } else {
+                self.notice = Some(
+                    "Annotation limit reached; this one is lost when the window changes".into(),
+                );
+            }
+        } else {
+            self.annotations.remove(&packet.id);
+        }
+        true
+    }
+    /// Selects the next (or previous) displayed packet after the selection
+    /// that matches `filter`; with `wrap`, continues from the other end.
+    pub fn find(&mut self, filter: &Filter, forward: bool, wrap: bool) -> bool {
+        let count = self.visible.len();
+        let start = self.selected_index();
+        let matches = |index: &usize| {
+            let packet = self.visible.get(*index).and_then(|id| self.packets.get(id));
+            packet.is_some_and(|packet| filter.matches(packet))
+        };
+        let after = start.map_or(0, |index| index + 1)..count;
+        let before = 0..start.unwrap_or(count);
+        let found = match (forward, wrap) {
+            (true, false) => after.into_iter().find(matches),
+            (true, true) => after
+                .chain(0..start.map_or(0, |index| index + 1))
+                .find(matches),
+            (false, false) => before.rev().find(matches),
+            (false, true) => before
+                .rev()
+                .chain((start.unwrap_or(count)..count).rev())
+                .find(matches),
+        };
+        found.map(|index| self.select_index(index)).is_some()
     }
     pub fn set_filter(&mut self, text: &str) -> Result<(), String> {
         let filter = Filter::parse(text)?;
@@ -149,7 +269,7 @@ impl Session {
         let mut exhausted = true;
         for (&id, packet) in self.packets.range((start, std::ops::Bound::Unbounded)) {
             self.scan_after = Some(id);
-            if self.filter.matches(&packet.summary) {
+            if self.filter.matches(packet) {
                 self.visible.push_back(id);
             }
             if started.elapsed() >= budget {
@@ -238,5 +358,54 @@ mod tests {
         assert!(!session.filtering);
         assert!(session.set_filter("bogus").is_err());
         assert_eq!(session.visible.len(), 2);
+    }
+    #[test]
+    fn learns_names_from_dns_response_summaries() {
+        let (name, addresses) =
+            dns_answers("Response A example.com → www.example.com, 192.0.2.7, 2001:db8::7 · [x]")
+                .unwrap();
+        assert_eq!(name, "example.com");
+        assert_eq!(addresses.len(), 2);
+        for other in [
+            "Query A example.com",
+            "Response A example.com",
+            "Response A x → cname.only",
+        ] {
+            assert!(dns_answers(other).is_none());
+        }
+    }
+    #[test]
+    fn annotations_survive_window_changes_and_search_moves_the_selection() {
+        let mut session = Session::new(1 << 20, 10);
+        (1..=4).for_each(|id| session.insert(packet(id)));
+        session.select_index(1);
+        let before = session.bytes;
+        assert!(session.annotate(Some(true), Some(Some("odd".into()))));
+        assert_eq!(session.bytes, before + 3);
+        session.set_filter("marked comment~odd").unwrap();
+        session.filter_step(Duration::from_secs(1));
+        assert_eq!(session.visible, [2]);
+        session.next_window();
+        session.insert(packet(2));
+        assert!(session.packet(2).unwrap().mark);
+        assert_eq!(session.packet(2).unwrap().comment.as_deref(), Some("odd"));
+        session.annotate(Some(false), Some(None));
+        assert!(session.annotations.is_empty());
+
+        session.set_filter("").unwrap();
+        (5..=8).for_each(|id| session.insert(packet(id)));
+        session.filter_step(Duration::from_secs(1));
+        session.select_index(0);
+        let any = Filter::containing(&[0]);
+        assert!(session.find(&any, true, false));
+        assert_eq!(session.selected, Some(5));
+        assert!(session.find(&any, false, false));
+        assert_eq!(session.selected, Some(2));
+        assert!(!session.find(&any, false, false));
+        assert!(session.find(&any, false, true));
+        assert_eq!(session.selected, Some(8));
+        assert!(session.find(&any, true, true));
+        assert_eq!(session.selected, Some(2));
+        assert!(!session.find(&Filter::containing(b"absent"), true, true));
     }
 }
