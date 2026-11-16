@@ -6,14 +6,13 @@ A terminal packet inspector: packet table, protocol tree and hex view, with mous
 
 ## Download
 
-Prebuilt Linux binaries (x86-64 and ARM64, Ubuntu 24.04 or compatible) are on the [GitHub Releases page](https://github.com/s-a-tanjim/packetread/releases). Download the archive for your CPU (`uname -m`), then:
+On Linux (x86-64 or ARM64, Ubuntu 24.04 or compatible), install the latest [release](https://github.com/s-a-tanjim/packetread/releases) with one command:
 
 ```sh
-tar -xzf packetread-*-x86_64-unknown-linux-gnu.tar.gz
-sudo apt-get install libpcap0.8t64 libcap2-bin
-sudo install -m755 packetread-*/packetread packetread-*/packetread-capture /usr/local/bin/
-sudo setcap cap_net_raw=ep /usr/local/bin/packetread-capture   # only needed for live capture
+curl -fsSL https://raw.githubusercontent.com/s-a-tanjim/packetread/master/scripts/install.sh | sh
 ```
+
+It verifies the download, installs into `/usr/local/bin` and enables live capture; it asks for your `sudo` password.
 
 Or build from source (needs Rust, `build-essential`, `pkg-config` and `libpcap-dev`):
 
