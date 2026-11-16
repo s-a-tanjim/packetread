@@ -156,10 +156,14 @@ fn directories_and_devices_are_rejected() {
 #[cfg(unix)]
 #[test]
 fn named_pipes_and_symlinks_to_them_are_rejected_without_blocking() {
-    use rustix::fs::{mkfifoat, Mode, CWD};
     let temp = tempfile::tempdir().unwrap();
     let fifo = temp.path().join("stalled.pcap");
-    mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
+    // The `mkfifo` command, because rustix has no `mkfifoat` on macOS.
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
     let alias = temp.path().join("alias.pcap");
     std::os::unix::fs::symlink(&fifo, &alias).unwrap();
     for path in [&fifo, &alias] {
