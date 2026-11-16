@@ -1,5 +1,5 @@
 //! Display-filter language: predicates joined by AND (also implied by
-//! whitespace), OR, NOT and parentheses. See `README.md` for the reference.
+//! whitespace), OR, NOT and parentheses. See `docs/USAGE.md` for the reference.
 use crate::decode::{diag, Packet, Protocol};
 use regex::bytes::{Regex, RegexBuilder};
 use std::net::IpAddr;

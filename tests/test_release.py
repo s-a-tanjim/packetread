@@ -51,7 +51,7 @@ class ReleasePackagingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="packetread-package-test-") as directory:
             root = Path(directory)
             for name in (
-                "Cargo.toml", "Cargo.lock", "README.md", "docs/DISTRIBUTION.md",
+                "Cargo.toml", "Cargo.lock", "README.md", "docs/DISTRIBUTION.md", "docs/USAGE.md",
                 "scripts/release-version.py", "scripts/package-release.sh",
                 "tests/fixtures/demo.pcap", "tests/fixtures/demo.pcapng",
             ):

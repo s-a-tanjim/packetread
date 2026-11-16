@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 description = "A colorful, mouse-friendly terminal packet inspector"
 
+# The helper has no unit tests, and its test executable would need the libpcap
+# runtime (wpcap.dll on Windows) just to start.
+[[bin]]
+name = "packetread-capture"
+path = "src/bin/packetread-capture.rs"
+test = false
+
 [dependencies]
 aes = "0.8"
 clap = { version = "4.5", features = ["derive"] }

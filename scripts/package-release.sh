@@ -29,7 +29,7 @@ install -m755 "$binary" "$stage_dir/$stem/packetread"
 install -m755 "$helper" "$stage_dir/$stem/packetread-capture"
 install -m644 README.md Cargo.lock "$stage_dir/$stem/"
 install -m644 docs/DISTRIBUTION.md "$stage_dir/$stem/INSTALL.md"
-install -m644 docs/DISTRIBUTION.md "$stage_dir/$stem/docs/"
+install -m644 docs/DISTRIBUTION.md docs/USAGE.md "$stage_dir/$stem/docs/"
 for license in LICENSE LICENSE.* NOTICE NOTICE.*; do
   if [[ -f "$license" ]]; then
     install -m644 "$license" "$stage_dir/$stem/"

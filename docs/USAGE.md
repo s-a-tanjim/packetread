@@ -1,12 +1,12 @@
-# Packetread
+# Packetread usage reference
 
 A Rust terminal packet inspector with a colorful, btop-inspired interface and mouse controls. Inspect saved captures or capture live traffic in a packet table, expandable protocol tree, and synchronized hex/ASCII view.
 
 ## Demo
 
-![Packetread demo: browse packets, inspect protocol fields and bytes, apply DNS, TCP and field filters, view statistics and the flow diagram, and summarize a capture](docs/assets/demo.gif)
+![Packetread demo: browse packets, inspect protocol fields and bytes, apply DNS, TCP and field filters, view statistics and the flow diagram, and summarize a capture](assets/demo.gif)
 
-Recorded with asciinema: launch `packetread`, open the included synthetic capture, and inspect its packets. [Download the recording](docs/assets/demo.cast) or [regenerate the demo](docs/DEMO.md).
+Recorded with asciinema: launch `packetread`, open the included synthetic capture, and inspect its packets. [Download the recording](assets/demo.cast) or [regenerate the demo](DEMO.md).
 
 ```sh
 asciinema play docs/assets/demo.cast
@@ -16,7 +16,7 @@ asciinema play docs/assets/demo.cast
 
 The GitHub Actions pipeline builds and tests Linux **x86-64** and **ARM64** packages. Branches and pull requests produce downloadable Actions artifacts; pushing a version tag such as `v0.1.0` publishes both archives and SHA-256 checksums to GitHub Releases after the checks pass.
 
-Release binaries target Ubuntu 24.04 or compatible systems with glibc 2.39+ and the libpcap runtime. See [installation and release instructions](docs/DISTRIBUTION.md) for architecture selection, runtime dependencies, capture permissions, and tagging a release.
+Release binaries target Ubuntu 24.04 or compatible systems with glibc 2.39+ and the libpcap runtime. See [installation and release instructions](DISTRIBUTION.md) for architecture selection, runtime dependencies, capture permissions, and tagging a release.
 
 ## Build and run
 
