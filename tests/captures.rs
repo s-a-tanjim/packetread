@@ -1,7 +1,6 @@
-use packetread::{
-    decode::{decode, details, Protocol},
-    source::{Seek, SourceSpec, Worker},
-};
+#[cfg(not(windows))]
+use packetread::decode::{decode, details, Protocol};
+use packetread::source::{Seek, SourceSpec, Worker};
 use std::{path::PathBuf, process::Command, time::Duration};
 
 fn fixture(name: &str) -> PathBuf {
@@ -10,6 +9,8 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+// Uses libpcap as the reference reader; Windows CI has no Npcap runtime.
+#[cfg(not(windows))]
 #[test]
 fn reads_both_formats_and_decodes_expected_protocols() {
     for file in ["demo.pcap", "demo.pcapng"] {
@@ -49,6 +50,8 @@ fn reads_both_formats_and_decodes_expected_protocols() {
     }
 }
 
+// Uses libpcap as the reference reader; Windows CI has no Npcap runtime.
+#[cfg(not(windows))]
 #[test]
 fn every_prefix_and_random_header_is_safe_to_inspect() {
     let mut capture = pcap::Capture::from_file(fixture("demo.pcap")).unwrap();
@@ -73,6 +76,8 @@ fn every_prefix_and_random_header_is_safe_to_inspect() {
     }
 }
 
+// Uses libpcap as the reference reader; Windows CI has no Npcap runtime.
+#[cfg(not(windows))]
 #[test]
 fn reads_linux_cooked_headers_and_ipv6_extensions() {
     let mut capture = pcap::Capture::from_file(fixture("demo.pcap")).unwrap();

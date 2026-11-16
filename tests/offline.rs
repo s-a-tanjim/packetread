@@ -157,6 +157,8 @@ fn section_changes_reset_interfaces_and_accept_empty_captures() {
     assert!(packets(&section(false)).is_empty());
 }
 
+// Uses libpcap as the reference reader; Windows CI has no Npcap runtime.
+#[cfg(not(windows))]
 #[test]
 fn original_fixtures_match_libpcap_packet_bytes_and_timestamps() {
     for file in ["demo.pcap", "demo.pcapng"] {
