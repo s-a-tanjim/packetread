@@ -15,7 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HISTORY: usize = 60;
+/// Rate samples kept for the charts: one per column, enough for very wide terminals.
+const HISTORY: usize = 1024;
 
 pub struct Ingest {
     worker: Option<Worker>,

@@ -755,3 +755,29 @@ fn presentation_rules_columns_buttons_completion_and_analysis_views() {
     key(&mut app, KeyCode::Char('V'));
     assert!(title(&app).1.contains("SIP calls: 0"));
 }
+
+#[test]
+fn rate_charts_fill_their_panels_at_any_terminal_width() {
+    for width in [100, 140, 320, 700] {
+        let mut app = app();
+        app.ingest.packet_history.iter_mut().for_each(|v| *v = 5);
+        app.ingest.byte_history.iter_mut().for_each(|v| *v = 5);
+        let terminal = draw(&mut app, width, 42);
+        let buffer = terminal.backend().buffer();
+        let symbol = |x: u16, y: u16| buffer.cell((x, y)).unwrap().symbol();
+        let row = |y: u16| (0..width).map(|x| symbol(x, y)).collect::<String>();
+        let title = (0..42).find(|&y| row(y).contains("pkt/s")).unwrap();
+        let mut bars = 0;
+        for x in 0..width - 1 {
+            if symbol(x, title + 1) == "█" {
+                bars += 1;
+                assert_ne!(
+                    symbol(x + 1, title + 1),
+                    " ",
+                    "gap after column {x} at width {width}"
+                );
+            }
+        }
+        assert!(bars > 0, "no chart drawn at width {width}");
+    }
+}

@@ -13,6 +13,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Sparkline},
     Frame,
 };
+use std::collections::VecDeque;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -246,6 +247,17 @@ fn toolbar(
     }
 }
 
+/// The newest samples that fit inside a bordered chart, one per column, so the
+/// chart fills its panel at any terminal width with the latest sample at the right edge.
+fn recent_samples(history: &VecDeque<u64>, area: Rect) -> Vec<u64> {
+    let width = usize::from(area.width.saturating_sub(2));
+    history
+        .iter()
+        .skip(history.len().saturating_sub(width))
+        .copied()
+        .collect()
+}
+
 fn metrics(frame: &mut Frame, app: &App, area: Rect) {
     let theme = app.theme;
     let chunks = Layout::horizontal([
@@ -280,8 +292,8 @@ fn metrics(frame: &mut Frame, app: &App, area: Rect) {
             .style(Style::default().fg(theme.text)),
         chunks[0],
     );
-    let pps: Vec<_> = app.ingest.packet_history.iter().copied().collect();
-    let bps: Vec<_> = app.ingest.byte_history.iter().copied().collect();
+    let pps = recent_samples(&app.ingest.packet_history, chunks[1]);
+    let bps = recent_samples(&app.ingest.byte_history, chunks[2]);
     frame.render_widget(
         Sparkline::default()
             .block(block(
