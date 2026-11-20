@@ -246,6 +246,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             file,
             filter,
             interval,
+            rank_by,
+            direction,
             top,
             bytes,
         }) => {
@@ -258,7 +260,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                 Ok(())
             })?;
             let unit = if bytes { Unit::Bytes } else { Unit::Packets };
-            println!("{}", stats.report(top, unit).join("\n"));
+            println!(
+                "{}",
+                stats
+                    .ranked_report(top, unit, rank_by, direction)
+                    .join("\n")
+            );
             return Ok(());
         }
         Some(Command::Graph {

@@ -1,8 +1,10 @@
 mod dialogs;
 mod panes;
+mod stats;
 
 use super::{
-    app::{Action, App, Pane, Regions, TextInput},
+    app::{Action, App, Pane, Regions, Screen, TextInput},
+    dashboard::{Command as DashboardCommand, Tab},
     theme::Theme,
 };
 use crate::decode::safe_text;
@@ -93,7 +95,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     filter(frame, app, chunks[3]);
     tabs(frame, app, chunks[4]);
     app.regions.body = chunks[5];
-    if area.width >= 110 && chunks[5].height >= 10 {
+    let stats = app.screen == Screen::Stats;
+    if stats {
+        stats::draw(frame, app, chunks[5]);
+    } else if area.width >= 110 && chunks[5].height >= 10 {
         let body = chunks[5];
         let top_height =
             (u32::from(body.height.saturating_sub(1)) * u32::from(app.table_percent) / 100) as u16;
@@ -140,6 +145,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let selected_warning = app
         .session
         .selected_packet()
+        .filter(|_| !stats)
         .and_then(|p| p.summary.warning.as_deref());
     let line = if app.ingest.status.error.is_some() || app.ingest.window_full {
         app.notice.as_str()
@@ -161,7 +167,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
         ),
         Line::styled(
-            " / filter · a filter on selection · f find · m mark · w save · S stats · E expert · F stream · ? help",
+            if stats {
+                stats_hint(app)
+            } else {
+                " / filter · a filter on selection · f find · m mark · w save · S stats · E expert · F stream · ? help"
+            },
             Style::default().fg(theme.muted),
         ),
     ];
@@ -194,7 +204,16 @@ fn toolbar_entries(app: &App) -> Vec<(&'static str, Action, bool)> {
         ("BPF", Action::Bpf, live),
         ("Find", Action::Find, any),
         ("Save", Action::Export(false), any),
-        ("Stats", Action::Stats, any),
+        (
+            // The button names the screen it switches to.
+            if app.screen == Screen::Stats {
+                "Inspect"
+            } else {
+                "Stats"
+            },
+            Action::Stats,
+            any,
+        ),
         ("Stream", Action::FollowStream, any),
         ("Theme", Action::Theme, true),
         ("Help", Action::Help, true),
@@ -411,26 +430,123 @@ fn filter(frame: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// Keys for the open Stats tab, the most specific first.
+fn stats_hint(app: &App) -> &'static str {
+    match app.stats.as_ref().map(|d| d.tab) {
+        Some(Tab::Overview) | None => {
+            " Enter open row · Tab / 1-5 section · u unit · r update now · f full report · S inspect"
+        }
+        Some(Tab::Ips) => {
+            " Enter conversations · p packets · u unit · d direction · Tab section · r update now · S inspect"
+        }
+        Some(Tab::Conversations) => {
+            " Enter stream packets · p address packets · x all · ← back · Tab section · r update now · S inspect"
+        }
+        Some(Tab::Protocols) => {
+            " Enter packets · u unit · Tab / 1-5 section · r update now · f full report · S inspect"
+        }
+        Some(Tab::Issues) => {
+            " Enter first packet · p all packets · Tab / 1-5 section · r update now · S inspect"
+        }
+    }
+}
+
+/// The screen tabs, then the sections of the screen that is open: the panes
+/// of Packets or the tabs of Stats.
 fn tabs(frame: &mut Frame, app: &mut App, area: Rect) {
-    for (index, (pane, title)) in [
-        (Pane::Packets, "1 Packets"),
-        (Pane::Details, "2 Details"),
-        (Pane::Bytes, "3 Bytes"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let rect = Rect::new(area.x + index as u16 * 15, area.y, 14, 1);
-        let color = if pane == app.pane {
-            app.theme.cyan
+    let theme = app.theme;
+    let (current, pane) = (app.screen, app.pane);
+    let stats = current == Screen::Stats;
+    let open_tab = app.stats.as_ref().map(|d| d.tab);
+    let issues: u64 = app
+        .stats
+        .as_ref()
+        .map_or(0, |d| d.stats.events.iter().map(|(_, count)| count).sum());
+    let sections = |compact: bool| -> Vec<(String, Action, bool)> {
+        if !stats {
+            return [
+                (Pane::Packets, "1 Packets"),
+                (Pane::Details, "2 Details"),
+                (Pane::Bytes, "3 Bytes"),
+            ]
+            .into_iter()
+            .map(|(to, title)| (format!("[ {title} ]"), Action::Focus(to), to == pane))
+            .collect();
+        }
+        Tab::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let label = if compact {
+                    format!("{} {}", index + 1, tab.short())
+                } else if tab == Tab::Issues && issues > 0 {
+                    format!("[ {} {} · {issues} ]", index + 1, tab.title())
+                } else {
+                    format!("[ {} {} ]", index + 1, tab.title())
+                };
+                let action = Action::Dashboard(DashboardCommand::Tab(tab));
+                (label, action, open_tab == Some(tab))
+            })
+            .collect()
+    };
+    let screens = |compact: bool| {
+        [("Inspect", Screen::Packets), ("Stats", Screen::Stats)].map(|(title, screen)| {
+            let label = if compact {
+                title.to_string()
+            } else {
+                format!(" {title} ")
+            };
+            (label, screen)
+        })
+    };
+    let width = |compact: bool| {
+        let gap = if compact { 2 } else { 1 };
+        let screens: usize = screens(compact).iter().map(|(l, _)| l.len() + 1).sum();
+        let sections: usize = sections(compact)
+            .iter()
+            .map(|(label, _, _)| Line::raw(label.as_str()).width() + gap)
+            .sum();
+        screens + 2 + sections - gap
+    };
+    let compact = width(false) > usize::from(area.width);
+    let mut x = area.x;
+    let mut place = |frame: &mut Frame, app: &mut App, label: String, style, action, gap| {
+        let width = (Line::raw(label.as_str()).width() as u16).min(area.right().saturating_sub(x));
+        if width > 0 {
+            let rect = Rect::new(x, area.y, width, 1);
+            frame.render_widget(Paragraph::new(label).style(style), rect);
+            if let Some(action) = action {
+                app.regions.buttons.push((rect, action));
+            }
+        }
+        x = x.saturating_add(width + gap);
+    };
+    for (label, screen) in screens(compact) {
+        let style = if screen == current {
+            bold(theme.bg).bg(theme.cyan)
         } else {
-            app.theme.muted
+            bold(theme.muted).bg(theme.panel)
         };
-        frame.render_widget(
-            Paragraph::new(format!("[ {title} ]")).style(bold(color)),
-            rect,
+        place(frame, app, label, style, Some(Action::Screen(screen)), 1);
+    }
+    place(
+        frame,
+        app,
+        "│".into(),
+        Style::default().fg(theme.muted),
+        None,
+        1,
+    );
+    for (label, action, active) in sections(compact) {
+        let color = if active { theme.cyan } else { theme.muted };
+        place(
+            frame,
+            app,
+            label,
+            bold(color),
+            Some(action),
+            if compact { 2 } else { 1 },
         );
-        app.regions.buttons.push((rect, Action::Focus(pane)));
     }
 }
 

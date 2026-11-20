@@ -1,6 +1,9 @@
-use super::theme::Theme;
+use super::{
+    dashboard::{Command as DashboardCommand, Dashboard, Tab, Target},
+    theme::Theme,
+};
 use crate::{
-    decode::{tls::is_record, Layer},
+    decode::{diag, tls::is_record, Layer},
     export::Writer,
     filter::{self, Field, Filter},
     follow::Follower,
@@ -9,7 +12,7 @@ use crate::{
     profile::Profile,
     session::Session,
     source::{interfaces, LiveSpec, Seek, SourceSpec},
-    stats::{Expert, Stats, Unit},
+    stats::{Expert, Unit},
     tls::{decrypt, KeyLog},
 };
 use ratatui::layout::Rect;
@@ -18,11 +21,13 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Payload bytes shown when following one stream.
 const FOLLOW_LIMIT: usize = 4 * 1024 * 1024;
+/// Shortest time between automatic recounts of the Stats screen.
+const STATS_REFRESH: Duration = Duration::from_secs(1);
 const INTERVALS: [f64; 7] = [0.001, 0.01, 0.1, 1.0, 10.0, 60.0, 600.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +35,13 @@ pub enum Pane {
     Packets,
     Details,
     Bytes,
+}
+
+/// What fills the area below the filter bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Packets,
+    Stats,
 }
 
 #[derive(Clone, Debug)]
@@ -48,7 +60,10 @@ pub enum Action {
     Mark,
     Comment,
     Goto,
+    /// Switch between the packet panes and the Stats screen.
     Stats,
+    Screen(Screen),
+    Dashboard(DashboardCommand),
     FollowStream,
     KeyLog,
     SaveProfile,
@@ -225,8 +240,8 @@ pub const HELP: [&str; 44] = [
     "m: mark packet. c: comment. Filter with `marked` / `comment`.",
     "w: save displayed packets. W: save the selected packet.",
     "  .pcap / .pcapng keep raw bytes; .json / .csv keep decoded data.",
-    "S: statistics for displayed packets (conversations, endpoints,",
-    "  protocol hierarchy, TCP diagnostics, response times, graph).",
+    "S: Stats screen: busiest IPs, conversations, protocols, TCP issues.",
+    "  Tab / 1-5: section. Enter opens a row, p its packets. S returns.",
     "F: follow the selected packet's TCP/UDP stream (h: hex).",
     "K: load a TLS key log (SSLKEYLOGFILE); F then shows plaintext.",
     "n / Next, p / Prev: move between bounded file windows.",
@@ -287,6 +302,17 @@ pub struct App {
     pub keylog: Option<Arc<KeyLog>>,
     pub keylog_path: Option<PathBuf>,
     pub profile: String,
+    pub screen: Screen,
+    /// Counts behind the Stats screen; kept while a row's packets are inspected.
+    pub stats: Option<Box<Dashboard>>,
+    /// A Stats row replaced the display filter or moved the selection.
+    stats_drilled: bool,
+    /// Stats are recounted once the display filter has settled.
+    stats_pending: bool,
+    /// Earliest moment arriving packets recount the Stats screen again.
+    pub stats_next: Instant,
+    /// A row's packets were requested: select the first once the filter is applied.
+    stats_reveal: bool,
     stats_interval: f64,
     stats_unit: Unit,
     follow_hex: bool,
@@ -338,6 +364,12 @@ impl App {
             keylog: None,
             keylog_path: None,
             profile: "default".into(),
+            screen: Screen::Packets,
+            stats: None,
+            stats_drilled: false,
+            stats_pending: false,
+            stats_next: Instant::now(),
+            stats_reveal: false,
             stats_interval: 1.0,
             stats_unit: Unit::Packets,
             follow_hex: false,
@@ -427,6 +459,7 @@ impl App {
             self.apply(Action::Interfaces);
             return;
         }
+        self.forget_stats();
         self.session.restart();
         self.window_first = 1;
         self.window_starts.clear();
@@ -437,6 +470,7 @@ impl App {
     /// Reloads the file window starting at packet `from`, or at the first
     /// later packet matching `find`.
     fn seek(&mut self, from: u64, find: Option<Filter>, select_first: bool) {
+        self.forget_stats();
         self.session.next_window();
         // The caller words its own notice.
         self.session.take_notice();
@@ -485,6 +519,12 @@ impl App {
                 "File window full · click Next to continue; earlier packets leave memory".into();
         }
         self.session.filter_step(Duration::from_millis(2));
+        let stats_refreshed = self.sync_stats();
+        if self.stats_reveal && !self.session.filtering() {
+            self.stats_reveal = false;
+            self.session.select_index(0);
+            self.reveal_packet();
+        }
         if self.select_first && !self.session.visible().is_empty() {
             self.session.select_index(0);
             self.window_first = self.session.packets().next().map_or(1, |p| p.id);
@@ -496,6 +536,32 @@ impl App {
             self.seek(back, None, false);
             self.notice = "No further match in the capture".into();
         }
+        self.update_details();
+        if let Some(notice) = self.session.take_notice() {
+            self.notice = notice;
+        }
+        let status = &self.ingest.status;
+        if status.permission_denied {
+            self.notice =
+                "Live capture needs CAP_NET_RAW · click Help for setup instructions".into();
+            if previous_status.error != status.error && self.dialog.is_none() {
+                self.dialog = Some(Dialog::Help);
+            }
+        } else if let Some(error) = &status.error {
+            self.notice = format!("Source error: {error}");
+        } else if self.notice == "Opening source…" && (status.packets > 0 || status.done) {
+            self.notice = "Select packets and protocol fields to inspect their bytes".into();
+        }
+        rate_changed
+            || stats_refreshed
+            || was_filtering
+            || *status != previous_status
+            || self.session.selected() != previous_selection
+            || self.session.len() != previous_len
+            || self.session.evicted() != previous_evicted
+    }
+
+    fn update_details(&mut self) {
         if self.cached_id != self.session.selected() {
             self.layers = self
                 .session
@@ -521,27 +587,6 @@ impl App {
             self.detail_offset = 0;
             self.byte_offset = 0;
         }
-        if let Some(notice) = self.session.take_notice() {
-            self.notice = notice;
-        }
-        let status = &self.ingest.status;
-        if status.permission_denied {
-            self.notice =
-                "Live capture needs CAP_NET_RAW · click Help for setup instructions".into();
-            if previous_status.error != status.error && self.dialog.is_none() {
-                self.dialog = Some(Dialog::Help);
-            }
-        } else if let Some(error) = &status.error {
-            self.notice = format!("Source error: {error}");
-        } else if self.notice == "Opening source…" && (status.packets > 0 || status.done) {
-            self.notice = "Select packets and protocol fields to inspect their bytes".into();
-        }
-        rate_changed
-            || was_filtering
-            || *status != previous_status
-            || self.session.selected() != previous_selection
-            || self.session.len() != previous_len
-            || self.session.evicted() != previous_evicted
     }
 
     pub fn detail_rows(&self) -> Vec<(usize, Option<usize>)> {
@@ -643,6 +688,7 @@ impl App {
                     .last_id()
                     .map_or(self.window_first, |id| id + 1);
                 if self.ingest.next_window(&mut self.session) {
+                    self.forget_stats();
                     self.window_starts.push(self.window_first);
                     self.window_first = next;
                     self.packet_offset = 0;
@@ -677,7 +723,12 @@ impl App {
                 let path = self.keylog_path.as_ref().map(|p| p.display().to_string());
                 self.open_input(Dialog::KeyLog(TextInput::new(path.unwrap_or_default())));
             }
-            Action::Stats => self.open_stats(),
+            Action::Stats => self.show(match self.screen {
+                Screen::Packets => Screen::Stats,
+                Screen::Stats => Screen::Packets,
+            }),
+            Action::Screen(screen) => self.show(screen),
+            Action::Dashboard(command) => self.dashboard_command(command),
             Action::FollowStream => self.open_follow(),
             Action::SaveProfile => {
                 let profile = Profile {
@@ -720,7 +771,7 @@ impl App {
                 } else {
                     Unit::Packets
                 };
-                self.open_stats();
+                self.open_full_report(false);
             }
             Action::ViewInterval(longer) => {
                 let index = INTERVALS
@@ -733,7 +784,7 @@ impl App {
                     index.saturating_sub(1)
                 };
                 self.stats_interval = INTERVALS[index.min(INTERVALS.len() - 1)];
-                self.open_stats();
+                self.open_full_report(true);
             }
             Action::ViewHex => {
                 self.follow_hex = !self.follow_hex;
@@ -857,6 +908,13 @@ impl App {
             }
             Action::ApplyFilter => match self.session.set_filter(&self.filter.value) {
                 Ok(()) => {
+                    // A new filter means a new snapshot, not a drill-down to undo.
+                    self.stats_drilled = false;
+                    if self.screen == Screen::Stats {
+                        self.stats_pending = true;
+                    } else {
+                        self.stats = None;
+                    }
                     self.editing_filter = false;
                     self.filter_error = None;
                     self.packet_offset = 0;
@@ -1139,16 +1197,228 @@ impl App {
         }
     }
 
-    // ponytail: recomputed over the displayed packets each time it opens.
-    fn open_stats(&mut self) {
-        let mut stats = Stats::new(self.stats_interval);
-        self.session
-            .visible_packets()
-            .for_each(|packet| stats.add(packet));
+    /// Drops the snapshot and returns to the packets it no longer describes.
+    fn forget_stats(&mut self) {
+        self.stats = None;
+        (self.stats_drilled, self.stats_pending) = (false, false);
+        self.stats_reveal = false;
+        self.screen = Screen::Packets;
+    }
+
+    fn stats_scope(&self) -> &'static str {
+        match self.source {
+            Some(SourceSpec::File(_)) => "file window",
+            _ => "retained packets",
+        }
+    }
+
+    fn show(&mut self, screen: Screen) {
         self.editing_filter = false;
+        if screen == self.screen {
+            return;
+        }
+        self.screen = screen;
+        if screen == Screen::Packets {
+            return;
+        }
+        // Notices so far describe the packet panes.
+        self.notice.clear();
+        if !std::mem::take(&mut self.stats_drilled) {
+            self.stats_pending = true;
+        } else if let Some(dashboard) = &self.stats {
+            // Back from a row's packets: the snapshot and its filter return.
+            if self.session.filter_text() != dashboard.filter {
+                self.session
+                    .set_filter(&dashboard.filter)
+                    .expect("previously applied filter");
+                self.filter = TextInput::new(dashboard.filter.clone());
+                self.filter_error = None;
+                self.packet_offset = 0;
+            }
+        }
+        self.sync_stats();
+    }
+
+    /// Recounts the Stats screen when it is waiting for a display filter or
+    /// packets have arrived since the last count. A filter that is still
+    /// being applied postpones it. Returns whether it ran.
+    fn sync_stats(&mut self) -> bool {
+        let last_id = self.session.last_id().unwrap_or(0);
+        let arrivals = self.stats.as_ref().is_some_and(|d| d.last_id != last_id)
+            && Instant::now() >= self.stats_next;
+        let wanted = self.stats_pending || self.stats.is_none() || arrivals;
+        if self.screen != Screen::Stats || !wanted || self.session.filtering() {
+            return false;
+        }
+        self.stats_pending = false;
+        let scope = self.stats_scope();
+        let started = Instant::now();
+        match &mut self.stats {
+            Some(dashboard) => dashboard.refresh(&self.session, self.stats_interval, scope),
+            None => {
+                let dashboard = Dashboard::new(&self.session, self.stats_interval, scope);
+                self.stats = Some(Box::new(dashboard));
+            }
+        }
+        // Counting a large window takes a while: spend about a tenth of the
+        // time on it at most.
+        self.stats_next = Instant::now() + STATS_REFRESH.max(10 * started.elapsed());
+        true
+    }
+
+    fn dashboard_command(&mut self, command: DashboardCommand) {
+        use DashboardCommand as Cmd;
+        if self.screen != Screen::Stats {
+            return;
+        }
+        let filtering = self.session.filtering();
+        let scope = self.stats_scope();
+        let Some(d) = self.stats.as_deref_mut() else {
+            return;
+        };
+        let packets = matches!(command, Cmd::Packets);
+        match command {
+            Cmd::Move(delta) => return d.move_by(delta),
+            Cmd::Page(pages) => {
+                return d.move_by(pages.saturating_mul(d.page_rows.max(1) as isize))
+            }
+            Cmd::Tab(tab) => return d.show(tab),
+            Cmd::NextTab(forward) => {
+                let index = Tab::ALL.iter().position(|tab| *tab == d.tab).unwrap_or(0);
+                let step = if forward { 1 } else { Tab::ALL.len() - 1 };
+                return d.show(Tab::ALL[(index + step) % Tab::ALL.len()]);
+            }
+            Cmd::Back => return d.back(),
+            Cmd::Unscope => return d.unscope(),
+            Cmd::Unit => {
+                d.unit = match d.unit {
+                    Unit::Bytes => Unit::Packets,
+                    Unit::Packets => Unit::Bytes,
+                };
+                return d.rebuild_keeping_selection();
+            }
+            Cmd::Direction => {
+                use crate::stats::Direction::*;
+                d.direction = match d.direction {
+                    Both => Sent,
+                    Sent => Received,
+                    Received => Both,
+                };
+                return d.rebuild_keeping_selection();
+            }
+            Cmd::Refresh => {
+                if filtering {
+                    d.message =
+                        "Display filter is updating · refresh again when it finishes".into();
+                } else {
+                    d.refresh(&self.session, self.stats_interval, scope);
+                }
+                return;
+            }
+            Cmd::Report => {
+                let lines = d.stats.report(15, self.stats_unit);
+                return self.show_stats_report(lines);
+            }
+            Cmd::Open(index) if index >= d.rows.len() => return,
+            Cmd::Open(index) => d.selected = index,
+            Cmd::Activate | Cmd::Packets => {}
+        }
+        let target = d.rows.get(d.selected).map(|row| row.target);
+        let predicate = match (target, d.address) {
+            // The address heading the Conversations tab, even with no rows.
+            (_, Some(ip)) if packets && d.tab == Tab::Conversations => format!("addr={ip}"),
+            (None, _) => return,
+            (Some(Target::AllIps), address) => return d.drill(Tab::Ips, address),
+            (Some(Target::Ip(ip)), _) if !packets => return d.drill(Tab::Conversations, Some(ip)),
+            (Some(Target::Ip(ip)), _) => format!("addr={ip}"),
+            (Some(Target::Stream(stream)), _) => format!("stream={stream}"),
+            (Some(Target::Protocol(name)), _) => {
+                format!("proto={}", name.to_ascii_lowercase())
+            }
+            (Some(Target::Issue(index)), _) if packets => {
+                format!("tcp.analysis={}", diag::NAMES[index].1)
+            }
+            (Some(Target::Issue(index)), _) => return self.open_evidence(index),
+        };
+        let scoped = format!("{predicate} and id<={}", d.last_id);
+        let text = if d.filter.is_empty() {
+            scoped
+        } else {
+            format!("({}) and {scoped}", d.filter)
+        };
+        if let Err(error) = self.session.set_filter(&text) {
+            d.message = error;
+            return;
+        }
+        self.filter = TextInput::new(text);
+        self.filter_error = None;
+        self.session.unfollow();
+        self.packet_offset = 0;
+        self.pane = Pane::Packets;
+        self.screen = Screen::Packets;
+        self.stats_drilled = true;
+        self.stats_reveal = true;
+        self.notice = "Showing the packets Stats counted · S returns to Stats".into();
+    }
+
+    /// Selects the first packet of a TCP issue and the field that shows it.
+    fn open_evidence(&mut self, issue: usize) {
+        let Some(d) = self.stats.as_deref_mut() else {
+            return;
+        };
+        let Some(id) = d.stats.events[issue].0.map(|example| example.packet) else {
+            return;
+        };
+        if !self.session.select_id(id) {
+            d.message = format!("Packet #{id} is no longer displayed");
+            return;
+        }
+        self.screen = Screen::Packets;
+        self.stats_drilled = true;
+        self.reveal_packet();
+        self.update_details();
+        self.pane = Pane::Details;
+        let field = if diag::NAMES[issue].0 == diag::ZERO_WINDOW {
+            "Window:"
+        } else {
+            "Sequence:"
+        };
+        self.collapsed.clear();
+        if let Some(index) = self.detail_rows().iter().position(|&(layer, index)| {
+            self.layers[layer].label == "TCP"
+                && index.is_some_and(|i| self.layers[layer].fields[i].label.starts_with(field))
+        }) {
+            self.apply(Action::SelectDetail(index));
+            reveal(
+                &mut self.detail_offset,
+                index,
+                self.regions.details.height as usize,
+            );
+        }
+        self.notice = format!("TCP evidence · packet #{id} · S returns to Stats");
+    }
+
+    fn open_full_report(&mut self, refresh: bool) {
+        let scope = self.stats_scope();
+        let Some(dashboard) = &mut self.stats else {
+            return;
+        };
+        if refresh {
+            if self.session.filtering() {
+                self.notice =
+                    "Display filter is updating · change the interval when it finishes".into();
+                return;
+            }
+            dashboard.refresh(&self.session, self.stats_interval, scope);
+        }
+        let lines = dashboard.stats.report(15, self.stats_unit);
+        self.show_stats_report(lines);
+    }
+
+    fn show_stats_report(&mut self, lines: Vec<String>) {
         self.dialog = Some(Dialog::Text {
             title: " STATISTICS · displayed packets ".into(),
-            lines: stats.report(15, self.stats_unit),
+            lines,
             offset: 0,
             view: View::Stats,
         });

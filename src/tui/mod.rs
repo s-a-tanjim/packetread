@@ -1,4 +1,5 @@
 mod app;
+mod dashboard;
 mod input;
 mod render;
 mod theme;

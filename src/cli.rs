@@ -141,6 +141,12 @@ pub enum Command {
         /// Rows per ranking.
         #[arg(long, default_value_t = 10)]
         top: usize,
+        /// Metric used to rank endpoints.
+        #[arg(long, value_enum, default_value = "bytes")]
+        rank_by: packetread::stats::Unit,
+        /// Direction used to rank endpoints.
+        #[arg(long, value_enum, default_value = "both")]
+        direction: packetread::stats::Direction,
         /// Graph bytes instead of packets.
         #[arg(long)]
         bytes: bool,

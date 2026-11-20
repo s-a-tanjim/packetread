@@ -206,14 +206,29 @@ Output files are always new: an existing path is refused rather than overwritten
 
 ```sh
 packetread stats traffic.pcap
+packetread stats traffic.pcap --rank-by packets --direction received --top 10
 packetread stats traffic.pcap --filter 'addr=192.0.2.10' --interval 0.1 --top 20 --bytes
 ```
 
-`stats` (and **Stats** / `S` in the interface, for the displayed packets) reports:
+**Stats** (`S`, or the **Stats** tab under the filter bar) replaces the packet panes with statistics for the displayed packets in the retained window. `S`, `Esc` or the **Inspect** tab returns to the packets; while Stats is open the toolbar's **Stats** button reads **Inspect** and does the same. The display filter above it still applies: applying a new filter on the Stats screen recounts them. While packets arrive, Stats updates by itself about once a second (less often when the window is large enough for counting to take a while), and the selection stays on its row as the ranking changes. `r` updates immediately.
+
+The screen has five sections. Switch with `Tab` / `Shift+Tab`, `1`–`5`, or a click.
+
+- **Overview** — a traffic chart, the five busiest addresses, the protocol mix and the TCP issues seen. Terminals narrower than 96 columns show the addresses and issues as one list.
+- **IPs** — up to 50 addresses with their total, share, sent and received amounts. `u` switches between bytes and packets, and `d` cycles through sent plus received, sent, and received. Share is relative to all endpoint contributions for that metric and direction. A frame with both addresses contributes once to sent and once to received. If the address table fills, Stats shows the omitted amount.
+- **Conversations** — the top 50 TCP/UDP conversations by wire bytes, for every address or for the one opened from Overview or IPs. `x` shows every address again.
+- **Protocols** — packets and bytes per protocol, as named in the packet list. `u` switches the ranking.
+- **Issues** — TCP retransmissions, out-of-order segments, duplicate ACKs, zero windows, keep-alives, fast retransmissions and resets, each with its count and first packet.
+
+Move with the arrows, `j` / `k`, Page Up / Page Down, Home / End or the wheel. `Enter` or a click opens the selected row: an address opens its conversations, a conversation or protocol lists its packets, and an issue opens its first packet with the TCP sequence or window field highlighted. `p` lists the packets behind a row instead: all traffic of an address (including traffic outside its streams), or every packet with that issue. Backspace returns to the row a section was opened from.
+
+Listing packets keeps the original display filter and excludes packets that arrived after Stats last updated, so the list matches the numbers you opened it from. Press `S` from the packet list to return to the same row and restore the original filter; Stats then catches up with any arrivals. Applying a filter of your own there ends the drill-down. Narrow terminals hide the less important columns first.
+
+The CLI reads the whole file. `--rank-by bytes|packets` and `--direction both|sent|received` control the endpoint ranking. Defaults are `bytes` and `both`. The CLI and **Full report** (`f` in Stats) include:
 
 - **Protocol hierarchy** — packets and bytes per network › transport › application path.
 - **Conversations** — TCP and UDP conversations ranked by bytes, with per-direction packet/byte totals, duration, and TCP problem counts. The `#N` number is the `stream` filter value and the `follow --stream` argument.
-- **Endpoints** — addresses ranked by bytes sent plus received.
+- **Endpoints** — addresses ranked by the selected metric and direction, with sent and received counts.
 - **TCP diagnostics** — totals of retransmissions, fast retransmissions, out-of-order segments, duplicate ACKs, zero windows, keep-alives and resets.
 - **Response times** — minimum/average/maximum for DNS query→response, HTTP request→response and TCP SYN→SYN/ACK.
 - **Traffic graph** — packets or bytes per interval. In the interface, `u` switches the unit and `+` / `-` change the interval (1 ms to 10 min); the same controls are clickable.

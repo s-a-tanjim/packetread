@@ -1,4 +1,5 @@
-use super::app::{contains, Action, App, Dialog, Drag, Pane, TextInput, View};
+use super::app::{contains, Action, App, Dialog, Drag, Pane, Screen, TextInput, View};
+use super::dashboard::{Command as DashboardCommand, Tab};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -45,7 +46,10 @@ fn key_event(app: &mut App, key: KeyEvent) {
         return;
     }
     if key.code == KeyCode::Esc {
-        app.dialog = None;
+        if app.dialog.is_none() && !app.editing_filter {
+            app.apply(Action::Screen(Screen::Packets));
+        }
+        app.apply(Action::CloseDialog);
         app.editing_filter = false;
         app.drag = None;
         return;
@@ -118,6 +122,7 @@ fn key_event(app: &mut App, key: KeyEvent) {
                     (KeyCode::Home | KeyCode::Char('g'), _) => Action::ScrollText(isize::MIN / 2),
                     (KeyCode::End | KeyCode::Char('G'), _) => Action::ScrollText(isize::MAX / 2),
                     (KeyCode::Char('q'), _) => Action::CloseDialog,
+                    (KeyCode::Backspace | KeyCode::Char('S'), View::Stats) => Action::CloseDialog,
                     (KeyCode::Char('u'), View::Stats) => Action::ViewUnit,
                     (KeyCode::Char('+' | '='), View::Stats) => Action::ViewInterval(true),
                     (KeyCode::Char('-'), View::Stats) => Action::ViewInterval(false),
@@ -131,7 +136,42 @@ fn key_event(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    let action = match key.code {
+    if app.screen == Screen::Stats {
+        let command = match key.code {
+            KeyCode::Enter | KeyCode::Right => DashboardCommand::Activate,
+            KeyCode::Down | KeyCode::Char('j') => DashboardCommand::Move(1),
+            KeyCode::Up | KeyCode::Char('k') => DashboardCommand::Move(-1),
+            KeyCode::PageDown => DashboardCommand::Page(1),
+            KeyCode::PageUp => DashboardCommand::Page(-1),
+            KeyCode::Home | KeyCode::Char('g') => DashboardCommand::Move(isize::MIN),
+            KeyCode::End | KeyCode::Char('G') => DashboardCommand::Move(isize::MAX),
+            KeyCode::Backspace | KeyCode::Left => DashboardCommand::Back,
+            KeyCode::Tab => DashboardCommand::NextTab(true),
+            KeyCode::BackTab => DashboardCommand::NextTab(false),
+            KeyCode::Char(digit @ '1'..='5') => {
+                DashboardCommand::Tab(Tab::ALL[digit as usize - '1' as usize])
+            }
+            KeyCode::Char('r') => DashboardCommand::Refresh,
+            KeyCode::Char('f') => DashboardCommand::Report,
+            KeyCode::Char('u') => DashboardCommand::Unit,
+            KeyCode::Char('d') => DashboardCommand::Direction,
+            KeyCode::Char('p') => DashboardCommand::Packets,
+            KeyCode::Char('x') => DashboardCommand::Unscope,
+            // Keys that act on the capture or the whole interface still work.
+            KeyCode::Char(
+                'q' | '?' | 'o' | 'i' | 's' | 't' | '/' | 'w' | 'S' | 'E' | 'P' | 'b',
+            )
+            | KeyCode::F(_) => return global_key(app, key.code),
+            _ => return,
+        };
+        app.apply(Action::Dashboard(command));
+        return;
+    }
+    global_key(app, key.code);
+}
+
+fn global_key(app: &mut App, code: KeyCode) {
+    let action = match code {
         KeyCode::Char('q') => Action::Quit,
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
         KeyCode::Char('o') => Action::Open,
@@ -255,6 +295,12 @@ fn mouse_event(app: &mut App, mouse: MouseEvent) {
                 return;
             }
             if app.dialog.is_some() {
+                return;
+            }
+            if app.screen == Screen::Stats {
+                if contains(app.regions.body, x, y) {
+                    app.apply(Action::Dashboard(DashboardCommand::Move(delta)));
+                }
                 return;
             }
             let pane = if contains(app.regions.packets, x, y) {

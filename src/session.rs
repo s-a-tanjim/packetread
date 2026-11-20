@@ -21,6 +21,7 @@ pub struct Session {
     byte_limit: usize,
     packet_limit: usize,
     filter: Filter,
+    filter_text: String,
     scan_after: Option<u64>,
     filtering: bool,
     // Marks and comments by packet ID; they survive file-window changes.
@@ -53,6 +54,7 @@ impl Session {
             byte_limit,
             packet_limit,
             filter: Filter::default(),
+            filter_text: String::new(),
             scan_after: None,
             filtering: false,
             annotations: BTreeMap::new(),
@@ -62,8 +64,10 @@ impl Session {
     /// Forgets every packet and counter; keeps the limits and the filter.
     pub fn restart(&mut self) {
         let filter = std::mem::take(&mut self.filter);
+        let filter_text = std::mem::take(&mut self.filter_text);
         *self = Self {
             filter,
+            filter_text,
             ..Self::new(self.byte_limit, self.packet_limit)
         };
     }
@@ -93,6 +97,9 @@ impl Session {
     }
     pub fn packet_limit(&self) -> usize {
         self.packet_limit
+    }
+    pub fn filter_text(&self) -> &str {
+        &self.filter_text
     }
     pub fn filter(&self) -> &Filter {
         &self.filter
@@ -253,6 +260,7 @@ impl Session {
     pub fn set_filter(&mut self, text: &str) -> Result<(), String> {
         let filter = Filter::parse(text)?;
         self.filter = filter;
+        self.filter_text = text.to_string();
         self.visible.clear();
         self.scan_after = None;
         self.filtering = true;

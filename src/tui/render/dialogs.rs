@@ -103,9 +103,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             );
             let options: &[(&str, Action)] = match view {
                 View::Stats => &[
-                    ("Unit (u)", Action::ViewUnit),
-                    ("Interval - ", Action::ViewInterval(false)),
-                    ("Interval + ", Action::ViewInterval(true)),
+                    ("Back", Action::CloseDialog),
+                    ("Unit", Action::ViewUnit),
+                    ("Interval -", Action::ViewInterval(false)),
+                    ("Interval +", Action::ViewInterval(true)),
                 ],
                 View::Follow => &[
                     ("Hex (h)", Action::ViewHex),
@@ -113,28 +114,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ],
                 View::Help => &[],
             };
-            let mut x = inner.x + 1;
-            let y = inner.bottom().saturating_sub(1);
-            for (label, action) in [
-                ("Up", Action::ScrollText(-10)),
-                ("Down", Action::ScrollText(10)),
-            ]
-            .iter()
-            .chain(options)
-            {
-                let width = label.len() as u16 + 4;
-                if x + width + 13 > inner.right() {
-                    break;
+            let bottom = inner.bottom().saturating_sub(1);
+            for (controls, y, reserve) in [
+                (
+                    &[
+                        ("Up", Action::ScrollText(-10)),
+                        ("Down", Action::ScrollText(10)),
+                    ][..],
+                    bottom,
+                    12,
+                ),
+                (options, bottom.saturating_sub(1), 0),
+            ] {
+                let mut x = inner.x + 1;
+                for (label, action) in controls {
+                    let width = label.len() as u16 + 4;
+                    if x.saturating_add(width + reserve) > inner.right() {
+                        break;
+                    }
+                    button(
+                        frame,
+                        app,
+                        Rect::new(x, y, width, 1),
+                        label,
+                        action.clone(),
+                        true,
+                    );
+                    x += width + 1;
                 }
-                button(
-                    frame,
-                    app,
-                    Rect::new(x, y, width, 1),
-                    label,
-                    action.clone(),
-                    true,
-                );
-                x += width + 1;
             }
         }
         Dialog::Open(text)

@@ -663,3 +663,30 @@ fn graphs_flows_voip_lua_decoders_and_key_options() {
         .unwrap()
         .contains("[Decrypted ESP] Query A example.com"));
 }
+
+#[test]
+fn endpoint_options_rank_only_the_endpoint_section() {
+    let path = fixture("demo.pcap");
+    let file = path.to_str().unwrap();
+    let report = stdout(&[
+        "stats",
+        file,
+        "--top",
+        "1",
+        "--rank-by",
+        "packets",
+        "--direction",
+        "received",
+    ]);
+    let (_, endpoints) = report
+        .split_once("ENDPOINTS · top 1 of 4 by packets received")
+        .unwrap();
+    assert!(endpoints.trim_start().starts_with("198.51.100.8"));
+    assert!(report.contains("CONVERSATIONS · top 1 of 4 by bytes"));
+    assert!(report.contains("TRAFFIC · packets per"));
+    let default = stdout(&["stats", file, "--top", "1"]);
+    let (_, endpoints) = default
+        .split_once("ENDPOINTS · top 1 of 4 by bytes")
+        .unwrap();
+    assert!(endpoints.trim_start().starts_with("192.0.2.10"));
+}

@@ -1,5 +1,5 @@
 use super::{
-    app::{Action, App, Dialog, Pane, TextInput},
+    app::{Action, App, Dialog, Pane, Screen, TextInput},
     input, render,
 };
 use crate::decode::Packet;
@@ -433,6 +433,7 @@ fn statistics_and_stream_views_open_scroll_and_reconfigure() {
     let mut app = loaded("protocols.pcap", 1000);
     app.apply(Action::Home);
     key(&mut app, KeyCode::Char('S'));
+    key(&mut app, KeyCode::Char('f'));
     assert!(text_view(&app).contains("CONVERSATIONS · top 15 of 9"));
     assert!(text_view(&app).contains("TRAFFIC · packets per 1 s"));
     key(&mut app, KeyCode::Char('u'));
@@ -457,7 +458,11 @@ fn statistics_and_stream_views_open_scroll_and_reconfigure() {
         assert!(matches!(app.dialog, Some(Dialog::Text { offset: 13, .. })));
         key(&mut app, KeyCode::Home);
     }
+    // The report closes onto the Stats screen; S returns to the packets.
     key(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen, Screen::Stats);
+    key(&mut app, KeyCode::Char('S'));
+    assert_eq!(app.screen, Screen::Packets);
 
     key(&mut app, KeyCode::Char('F'));
     let stream = text_view(&app);
@@ -780,4 +785,280 @@ fn rate_charts_fill_their_panels_at_any_terminal_width() {
         }
         assert!(bars > 0, "no chart drawn at width {width}");
     }
+}
+
+fn dashboard(app: &App) -> &super::dashboard::Dashboard {
+    assert_eq!(app.screen, Screen::Stats, "{}", app.notice);
+    app.stats.as_deref().expect("Stats snapshot")
+}
+
+fn row(app: &App, target: super::dashboard::Target) -> usize {
+    dashboard(app)
+        .rows
+        .iter()
+        .position(|row| row.target == target)
+        .unwrap_or_else(|| panic!("no row for {target:?}"))
+}
+
+fn click(app: &mut App, wanted: impl Fn(&Action) -> bool) {
+    let rect = app
+        .regions
+        .buttons
+        .iter()
+        .find(|(_, action)| wanted(action))
+        .expect("clickable region")
+        .0;
+    mouse(app, MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+}
+
+fn screen_text(app: &mut App, width: u16, height: u16) -> String {
+    let terminal = draw(app, width, height);
+    let buffer = terminal.backend().buffer();
+    buffer.content.iter().map(|cell| cell.symbol()).collect()
+}
+
+#[test]
+fn stats_drills_into_filtered_stream_and_restores_snapshot() {
+    use super::dashboard::{Command, Tab, Target};
+    let mut app = loaded("protocols.pcap", 1000);
+    filter(&mut app, "proto=http or proto=dns");
+    let expected_count = app.session.visible().len();
+    key(&mut app, KeyCode::Char('S'));
+    let ip = "192.0.2.10".parse().unwrap();
+    assert_eq!(dashboard(&app).stats.total.packets, expected_count as u64);
+    let index = row(&app, Target::Ip(ip));
+    for (width, height) in [(140, 42), (60, 22)] {
+        let _ = draw(&mut app, width, height);
+        click(
+            &mut app,
+            |a| matches!(a, Action::Dashboard(Command::Open(i)) if *i == index),
+        );
+        assert_eq!(dashboard(&app).tab, Tab::Conversations);
+        assert_eq!(dashboard(&app).address, Some(ip));
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(dashboard(&app).tab, Tab::Overview);
+        assert_eq!(dashboard(&app).selected, index);
+    }
+    key(&mut app, KeyCode::Enter);
+    let stream = row(&app, Target::Stream(0));
+    app.apply(Action::Dashboard(Command::Move(stream as isize)));
+    key(&mut app, KeyCode::Enter);
+    settle(&mut app);
+    assert_eq!(app.screen, Screen::Packets);
+    assert_eq!(app.session.visible().len(), 2);
+    assert!(app
+        .session
+        .visible_packets()
+        .all(|p| p.summary.stream == Some(0)));
+    // The list opens on the row's first packet, not on an earlier selection.
+    assert_eq!(app.session.selected_index(), Some(0));
+    assert_eq!(app.packet_offset, 0);
+    key(&mut app, KeyCode::Char('S'));
+    assert!(!app.notice.contains("returns to Stats"));
+    assert_eq!(dashboard(&app).selected, stream);
+    settle(&mut app);
+    assert_eq!(app.session.visible().len(), expected_count);
+    // The address heading the tab has packets outside its streams too.
+    key(&mut app, KeyCode::Char('p'));
+    settle(&mut app);
+    assert!(app.filter.value.contains("addr=192.0.2.10 and id<="));
+    key(&mut app, KeyCode::Char('S'));
+    key(&mut app, KeyCode::Char('x'));
+    assert_eq!(dashboard(&app).address, None);
+    key(&mut app, KeyCode::Backspace);
+    assert_eq!(dashboard(&app).tab, Tab::Overview);
+}
+
+#[test]
+fn long_rankings_name_what_they_leave_out_and_wide_graphs_their_interval() {
+    use super::dashboard::Tab;
+    use std::net::IpAddr;
+    let mut app = loaded("demo.pcap", 1000);
+    key(&mut app, KeyCode::Char('S'));
+    let mut stats = crate::stats::Stats::new(1.0);
+    for host in 0..120u8 {
+        let wire_len = if host == 0 { 1_000_000 } else { 100 };
+        let seconds = i128::from(host) * 1_000_000_000;
+        let mut packet = Packet::new(
+            u64::from(host) + 1,
+            seconds,
+            wire_len,
+            999,
+            vec![0; 16].into(),
+        );
+        packet.summary.src = Some(IpAddr::from([10, 0, 0, host]));
+        packet.summary.dst = Some(IpAddr::from([172, 16, 0, 1]));
+        stats.add(&packet);
+    }
+    let replaced = app.stats.as_mut().unwrap();
+    replaced.stats = stats;
+    replaced.show(Tab::Ips);
+    let text = screen_text(&mut app, 140, 42);
+    assert!(text.contains("IPs · 1 / 50 · top 50 of 121"), "{text}");
+    // A share too small for one decimal is not shown as zero.
+    assert!(text.contains("<0.1%"));
+    // The selection follows its address when a new ranking moves the row.
+    key(&mut app, KeyCode::Down);
+    let second = dashboard(&app).rows[1].target;
+    key(&mut app, KeyCode::Char('d'));
+    assert_eq!(dashboard(&app).selected, 0);
+    assert_eq!(dashboard(&app).rows[0].target, second);
+    key(&mut app, KeyCode::Char('1'));
+    // 120 one-second intervals share 66 columns, so each column covers two.
+    let text = screen_text(&mut app, 140, 42);
+    assert!(text.contains("Traffic · bytes per 2 s"), "{text}");
+    assert!(text.contains("in 2 s"));
+}
+
+#[test]
+fn zero_window_opens_the_advertised_window_field_and_handles_eviction() {
+    use super::dashboard::{Command, Target};
+    use crate::decode::diag;
+    let mut app = loaded("protocols.pcap", 30);
+    key(&mut app, KeyCode::Char('S'));
+    let zero_window = diag::NAMES
+        .iter()
+        .position(|(bit, _)| *bit == diag::ZERO_WINDOW)
+        .unwrap();
+    let event = row(&app, Target::Issue(zero_window));
+    app.apply(Action::Dashboard(Command::Open(event)));
+    assert_eq!(app.screen, Screen::Packets);
+    assert_eq!(app.session.selected(), Some(12));
+    assert_eq!(app.pane, Pane::Details);
+    let (layer, field) = app.detail_rows()[app.detail_selected];
+    assert_eq!(app.layers[layer].fields[field.unwrap()].label, "Window: 0");
+    key(&mut app, KeyCode::Char('S'));
+    assert_eq!(dashboard(&app).selected, event);
+    for id in 30..65 {
+        app.session
+            .insert(Packet::new(id, 0, 7, 999, vec![0; 7].into()));
+    }
+    // Stats recount arrivals without a key press, at most once a second.
+    app.tick();
+    assert!(dashboard(&app).stats.total.bytes > 7 * 30);
+    app.apply(Action::Dashboard(Command::Open(event)));
+    assert!(dashboard(&app).message.contains("Packet #12"));
+    app.stats_next = std::time::Instant::now();
+    app.tick();
+    assert_eq!(dashboard(&app).stats.total.bytes, 7 * 30);
+    assert_eq!(
+        dashboard(&app).message,
+        "Matching packets have no decoded IP addresses"
+    );
+}
+
+#[test]
+fn ip_rows_show_demo_shares_and_directional_rank() {
+    use super::dashboard::{Command, Tab};
+    let mut app = loaded("demo.pcap", 1000);
+    key(&mut app, KeyCode::Char('S'));
+    key(&mut app, KeyCode::Char('2'));
+    assert_eq!(dashboard(&app).tab, Tab::Ips);
+    assert_eq!(
+        dashboard(&app).rows[0].cells[..4],
+        ["1", "192.0.2.10", "497 B", "44.1%"]
+    );
+    let text = screen_text(&mut app, 140, 42);
+    assert!(text.contains("Rank: [Bytes] Packets (u)"), "{text}");
+    assert!(text.contains("44.1%  ██"), "{text}");
+    click(&mut app, |a| {
+        matches!(a, Action::Dashboard(Command::Direction))
+    });
+    key(&mut app, KeyCode::Char('d'));
+    assert_eq!(dashboard(&app).rows[0].cells[1], "198.51.100.8");
+    assert_eq!(dashboard(&app).rows[0].cells[2], "426 B");
+    key(&mut app, KeyCode::Char('u'));
+    assert_eq!(dashboard(&app).rows[0].cells[2], "8 pkts");
+    // A filter applied on the Stats screen takes a new snapshot there.
+    filter(&mut app, "id=999");
+    assert_eq!(dashboard(&app).tab, Tab::Ips);
+    assert_eq!(dashboard(&app).message, "No packets match");
+}
+
+#[test]
+fn stats_tabs_switch_scroll_and_list_packets_for_protocols_and_issues() {
+    use super::dashboard::{Command, Tab, Target};
+    let mut app = loaded("protocols.pcap", 1000);
+    let all = app.session.visible().len();
+    let _ = draw(&mut app, 140, 42);
+    click(&mut app, |a| matches!(a, Action::Screen(Screen::Stats)));
+    for (width, height) in [(140, 42), (100, 30), (80, 24), (60, 22)] {
+        for tab in Tab::ALL {
+            app.apply(Action::Dashboard(Command::Tab(tab)));
+            let text = screen_text(&mut app, width, height);
+            assert!(text.contains("Stats · file window"), "{text}");
+            // The toolbar button now leads back to the packets.
+            assert!(text.contains("[ Inspect ]") && !text.contains("[ Stats ]"));
+            assert!(!dashboard(&app).rows.is_empty(), "{tab:?} has no rows");
+        }
+    }
+    let wide = {
+        key(&mut app, KeyCode::Char('1'));
+        screen_text(&mut app, 140, 42)
+    };
+    for panel in ["Traffic", "Top talkers", "Protocols", "TCP issues"] {
+        assert!(wide.contains(panel), "missing {panel}");
+    }
+
+    click(&mut app, |a| {
+        matches!(a, Action::Dashboard(Command::Tab(Tab::Protocols)))
+    });
+    assert_eq!(dashboard(&app).tab, Tab::Protocols);
+    let _ = draw(&mut app, 60, 22);
+    let body = app.regions.body;
+    mouse(&mut app, MouseEventKind::ScrollDown, body.x + 2, body.y + 2);
+    assert_eq!(dashboard(&app).selected, 3);
+    key(&mut app, KeyCode::PageDown);
+    key(&mut app, KeyCode::End);
+    let _ = draw(&mut app, 60, 22);
+    let d = dashboard(&app);
+    assert_eq!(d.selected, d.rows.len() - 1);
+    assert!(d.offset > 0 && d.offset + d.page_rows == d.rows.len());
+
+    let dns = row(&app, Target::Protocol("DNS"));
+    app.apply(Action::Dashboard(Command::Open(dns)));
+    settle(&mut app);
+    assert_eq!(app.screen, Screen::Packets);
+    assert!(app.filter.value.starts_with("proto=dns and id<="));
+    assert!(!app.session.visible().is_empty());
+    assert!(app
+        .session
+        .visible_packets()
+        .all(|p| p.summary.protocol.name() == "DNS"));
+    key(&mut app, KeyCode::Char('S'));
+    assert_eq!(dashboard(&app).selected, dns);
+    settle(&mut app);
+    assert_eq!(app.session.visible().len(), all);
+
+    key(&mut app, KeyCode::Tab);
+    assert_eq!(dashboard(&app).tab, Tab::Issues);
+    key(&mut app, KeyCode::Char('p'));
+    settle(&mut app);
+    assert!(app.filter.value.starts_with("tcp.analysis="));
+    assert!(app.session.visible_packets().all(|p| p.summary.diag != 0));
+    key(&mut app, KeyCode::Char('S'));
+    key(&mut app, KeyCode::BackTab);
+    assert_eq!(dashboard(&app).tab, Tab::Protocols);
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen, Screen::Packets);
+    // Typing a filter by hand ends the drill-down: Stats starts afresh.
+    filter(&mut app, "proto=dns");
+    key(&mut app, KeyCode::Char('S'));
+    assert_eq!(dashboard(&app).tab, Tab::Overview);
+    assert_eq!(dashboard(&app).filter, "proto=dns");
+}
+
+#[test]
+fn opening_stats_while_the_filter_updates_waits_for_it() {
+    let mut app = loaded("protocols.pcap", 1000);
+    app.filter = TextInput::new("proto=dns".into());
+    app.apply(Action::ApplyFilter);
+    key(&mut app, KeyCode::Char('S'));
+    assert_eq!(app.screen, Screen::Stats);
+    let _ = draw(&mut app, 80, 24);
+    settle(&mut app);
+    let d = dashboard(&app);
+    assert_eq!(d.filter, "proto=dns");
+    assert_eq!(d.stats.total.packets, app.session.visible().len() as u64);
+    assert!(d.stats.total.packets > 0);
 }

@@ -2,6 +2,7 @@
 //! statistics over analyzed packets. Every table is bounded.
 use crate::decode::{diag, safe_text, Packet, Protocol};
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, HashMap},
     net::IpAddr,
 };
@@ -26,6 +27,8 @@ impl Counter {
 #[derive(Debug)]
 pub struct Conversation {
     pub tcp: bool,
+    /// Most recently decoded protocol above the transport layer.
+    pub application: Option<Protocol>,
     /// The side that sent the first packet, then its peer.
     pub ends: [(IpAddr, u16); 2],
     pub sent: [Counter; 2],
@@ -43,10 +46,67 @@ pub struct Timing {
     pub max_ns: i128,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
     Packets,
     Bytes,
+}
+
+impl Unit {
+    pub fn value(self, count: Counter) -> u64 {
+        match self {
+            Self::Packets => count.packets,
+            Self::Bytes => count.bytes,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Packets => "packets",
+            Self::Bytes => "bytes",
+        }
+    }
+
+    pub fn format(self, amount: u64) -> String {
+        match self {
+            Self::Packets => format!("{amount} pkts"),
+            Self::Bytes => size(amount),
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Both,
+    Sent,
+    Received,
+}
+
+impl Direction {
+    pub fn value(self, counts: [Counter; 2], unit: Unit) -> u64 {
+        let [sent, received] = counts.map(|c| unit.value(c));
+        match self {
+            Self::Both => sent + received,
+            Self::Sent => sent,
+            Self::Received => received,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "sent + received",
+            Self::Sent => "sent",
+            Self::Received => "received",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TcpExample {
+    pub packet: u64,
+    pub stream: u32,
+    pub source: IpAddr,
+    pub destination: IpAddr,
 }
 
 pub struct Stats {
@@ -56,6 +116,12 @@ pub struct Stats {
     pub conversations: BTreeMap<u32, Conversation>,
     /// Sent and received counters per address.
     pub endpoints: HashMap<IpAddr, [Counter; 2]>,
+    pub endpoint_totals: [Counter; 2],
+    pub omitted_endpoints: [Counter; 2],
+    /// First matching packet and count per `diag::NAMES` entry.
+    pub events: [(Option<TcpExample>, u64); diag::NAMES.len()],
+    /// Counters per packet-list protocol name.
+    pub protocols: HashMap<&'static str, Counter>,
     pub hierarchy: BTreeMap<String, Counter>,
     pub timings: BTreeMap<&'static str, Timing>,
     pub buckets: Vec<Counter>,
@@ -64,6 +130,16 @@ pub struct Stats {
     pub untracked: u64,
     // (kind, stream, transaction) → request time.
     pending: HashMap<(&'static str, u32, u16), i128>,
+}
+
+/// Partition first so a short report only sorts the rows it displays.
+fn top_rows<T, K: Ord>(mut rows: Vec<T>, top: usize, key: impl Fn(&T) -> K) -> Vec<T> {
+    if top < rows.len() {
+        rows.select_nth_unstable_by_key(top, &key);
+        rows.truncate(top);
+    }
+    rows.sort_unstable_by_key(key);
+    rows
 }
 
 impl Stats {
@@ -75,6 +151,10 @@ impl Stats {
             last_ns: 0,
             conversations: BTreeMap::new(),
             endpoints: HashMap::new(),
+            endpoint_totals: Default::default(),
+            omitted_endpoints: Default::default(),
+            events: [(None, 0); diag::NAMES.len()],
+            protocols: HashMap::new(),
             hierarchy: BTreeMap::new(),
             timings: BTreeMap::new(),
             buckets: Vec::new(),
@@ -122,16 +202,24 @@ impl Stats {
             path += " › Fragment";
         }
         self.hierarchy.entry(path).or_default().add(packet);
+        self.protocols
+            .entry(summary.protocol.name())
+            .or_default()
+            .add(packet);
 
+        let mut omitted = false;
         for (index, address) in [summary.src, summary.dst].into_iter().enumerate() {
             let Some(address) = address else { continue };
+            self.endpoint_totals[index].add(packet);
             if self.endpoints.len() < MAX_ENTRIES || self.endpoints.contains_key(&address) {
                 self.endpoints.entry(address).or_default()[index].add(packet);
-            } else if index == 0 {
-                self.untracked += 1;
+            } else {
+                self.omitted_endpoints[index].add(packet);
+                omitted = true;
             }
         }
 
+        self.untracked += u64::from(omitted);
         let (Some(stream), Some(src), Some(dst)) = (
             summary.stream,
             summary.src.zip(summary.src_port),
@@ -139,14 +227,26 @@ impl Stats {
         ) else {
             return;
         };
+        for ((flag, _), (example, count)) in diag::NAMES.iter().zip(&mut self.events) {
+            if summary.diag & flag != 0 {
+                *count += 1;
+                example.get_or_insert(TcpExample {
+                    packet: packet.id,
+                    stream,
+                    source: src.0,
+                    destination: dst.0,
+                });
+            }
+        }
         if self.conversations.len() >= MAX_ENTRIES && !self.conversations.contains_key(&stream) {
-            self.untracked += 1;
+            self.untracked += u64::from(!omitted);
             return;
         }
         let conversation = self
             .conversations
             .entry(stream)
             .or_insert_with(|| Conversation {
+                application: None,
                 tcp: summary.ip_proto == Some(6),
                 ends: [src, dst],
                 sent: Default::default(),
@@ -154,6 +254,12 @@ impl Stats {
                 last_ns: now,
                 problems: [0; diag::NAMES.len()],
             });
+        if !matches!(
+            summary.protocol,
+            Protocol::Tcp | Protocol::Udp | Protocol::Unknown
+        ) {
+            conversation.application = Some(summary.protocol);
+        }
         conversation.sent[usize::from(conversation.ends[0] != src)].add(packet);
         conversation.last_ns = now;
         for (index, (bit, _)) in diag::NAMES.iter().enumerate() {
@@ -199,8 +305,57 @@ impl Stats {
         }
     }
 
+    pub fn ranked_endpoints(
+        &self,
+        unit: Unit,
+        direction: Direction,
+        top: usize,
+    ) -> Vec<(IpAddr, [Counter; 2])> {
+        let rows = self
+            .endpoints
+            .iter()
+            .map(|(&ip, &counts)| (ip, counts))
+            .collect();
+        top_rows(rows, top, |(ip, counts)| {
+            (Reverse(direction.value(*counts, unit)), *ip)
+        })
+    }
+
+    pub fn ranked_protocols(&self, unit: Unit) -> Vec<(&'static str, Counter)> {
+        let rows = self.protocols.iter().map(|(&name, &c)| (name, c)).collect();
+        top_rows(rows, usize::MAX, |(name, c)| {
+            (Reverse(unit.value(*c)), *name)
+        })
+    }
+
+    pub fn ranked_conversations(
+        &self,
+        address: Option<IpAddr>,
+        top: usize,
+    ) -> Vec<(u32, &Conversation)> {
+        let rows = self
+            .conversations
+            .iter()
+            .filter(|(_, c)| address.is_none_or(|ip| c.ends.iter().any(|e| e.0 == ip)))
+            .map(|(&id, c)| (id, c))
+            .collect();
+        top_rows(rows, top, |(id, c)| {
+            (Reverse(c.sent[0].bytes + c.sent[1].bytes), *id)
+        })
+    }
+
     /// Terminal-safe report lines; `top` bounds each ranking.
     pub fn report(&self, top: usize, unit: Unit) -> Vec<String> {
+        self.ranked_report(top, unit, Unit::Bytes, Direction::Both)
+    }
+
+    pub fn ranked_report(
+        &self,
+        top: usize,
+        unit: Unit,
+        rank_by: Unit,
+        direction: Direction,
+    ) -> Vec<String> {
         let seconds = |ns: i128| ns as f64 / 1e9;
         let millis = |ns: i128| format!("{:.3} ms", ns as f64 / 1e6);
         let count = |c: Counter| format!("{} pkts / {}", c.packets, size(c.bytes));
@@ -222,16 +377,14 @@ impl Stats {
             lines.push(format!("  {path:<28} {}", count(*counter)));
         }
 
-        let mut conversations: Vec<_> = self.conversations.iter().collect();
-        conversations.sort_by_key(|(_, c)| std::cmp::Reverse(c.sent[0].bytes + c.sent[1].bytes));
         lines.extend([
             String::new(),
             format!(
                 "CONVERSATIONS · top {top} of {} by bytes",
-                conversations.len()
+                self.conversations.len()
             ),
         ]);
-        for (stream, c) in conversations.iter().take(top) {
+        for (stream, c) in self.ranked_conversations(None, top) {
             let problems: Vec<_> = diag::NAMES
                 .iter()
                 .zip(c.problems)
@@ -257,18 +410,33 @@ impl Stats {
             ));
         }
 
-        let mut endpoints: Vec<_> = self.endpoints.iter().collect();
-        endpoints
-            .sort_by_key(|(address, c)| (std::cmp::Reverse(c[0].bytes + c[1].bytes), **address));
+        let mut ranking = rank_by.label().to_owned();
+        if direction != Direction::Both {
+            ranking.push(' ');
+            ranking.push_str(direction.label());
+        }
+        let omitted = self.omitted_endpoints.iter().any(|c| c.packets > 0);
+        let tracked = if omitted { " tracked" } else { "" };
         lines.extend([
             String::new(),
-            format!("ENDPOINTS · top {top} of {} by bytes", endpoints.len()),
+            format!(
+                "ENDPOINTS · top {top} of {}{tracked} by {ranking}",
+                self.endpoints.len()
+            ),
         ]);
-        for (address, [sent, received]) in endpoints.into_iter().take(top) {
+        if omitted {
+            let [sent, received] = self.omitted_endpoints;
+            lines.push(format!(
+                "  Omitted endpoint contributions: sent {} · received {}",
+                count(sent),
+                count(received)
+            ));
+        }
+        for (address, [sent, received]) in self.ranked_endpoints(rank_by, direction, top) {
             lines.push(format!(
                 "  {address:<39} sent {} · received {}",
-                count(*sent),
-                count(*received)
+                count(sent),
+                count(received)
             ));
         }
 
@@ -319,7 +487,10 @@ impl Stats {
             ),
         ]);
         // Show the most recent intervals when there are more than fit a report.
-        let skip = self.buckets.len().saturating_sub(top.max(20) * 3);
+        let skip = self
+            .buckets
+            .len()
+            .saturating_sub(top.max(20).saturating_mul(3));
         for (index, bucket) in self.buckets.iter().enumerate().skip(skip) {
             let bar = "█".repeat((value(bucket) * 40).div_ceil(peak) as usize);
             let amount = if unit == Unit::Bytes {
@@ -424,5 +595,52 @@ impl Expert {
             lines.remove(0);
         }
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn endpoint_ranking_uses_wire_length_and_counts_each_direction() {
+        let large = IpAddr::from([192, 0, 2, 1]);
+        let chatty = IpAddr::from([192, 0, 2, 2]);
+        let mut stats = Stats::new(1.0);
+        for (ip, wire_len) in [(large, 1500), (chatty, 60), (chatty, 60)] {
+            let mut packet = Packet::new(1, 0, wire_len, 999, vec![0; 16].into());
+            packet.summary.src = Some(ip);
+            packet.summary.dst = Some(ip);
+            stats.add(&packet);
+        }
+        let (address, counts) = stats.ranked_endpoints(Unit::Bytes, Direction::Both, 1)[0];
+        assert_eq!(address, large);
+        assert_eq!(Direction::Both.value(counts, Unit::Bytes), 3000);
+        assert_eq!(
+            stats.ranked_endpoints(Unit::Packets, Direction::Sent, 1)[0].0,
+            chatty
+        );
+        assert_eq!(stats.endpoint_totals[0].bytes, 1620);
+    }
+
+    #[test]
+    fn full_endpoint_table_accounts_for_omitted_destinations_and_sources() {
+        let mut stats = Stats::new(1.0);
+        for index in 0..MAX_ENTRIES {
+            stats
+                .endpoints
+                .insert(IpAddr::V4(Ipv4Addr::from(index as u32)), Default::default());
+        }
+        let mut packet = Packet::new(1, 0, 80, 999, Box::default());
+        packet.summary.src = Some(IpAddr::from([0, 0, 0, 1]));
+        packet.summary.dst = Some(IpAddr::from([192, 0, 2, 1]));
+        stats.add(&packet);
+        packet.summary.src = packet.summary.dst;
+        stats.add(&packet);
+        assert_eq!(stats.untracked, 2);
+        assert_eq!(stats.endpoints.len(), MAX_ENTRIES);
+        assert_eq!(stats.omitted_endpoints.map(|c| c.bytes), [80, 160]);
+        assert_eq!(stats.endpoint_totals.map(|c| c.bytes), [160, 160]);
     }
 }
